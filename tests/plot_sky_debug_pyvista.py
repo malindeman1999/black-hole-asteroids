@@ -219,6 +219,27 @@ def _path_xyz_for_branch(a: np.ndarray, b: np.ndarray, bh: SchwarzschildBlackHol
     return xyz
 
 
+def _expand_faces_with_seam_fix(points: np.ndarray, faces: np.ndarray, uv: np.ndarray):
+    """
+    Expand indexed mesh to per-face vertices and unwrap U on seam-crossing faces.
+    This prevents texture interpolation from spanning across u=0/1.
+    """
+    tri_pts = np.asarray(points, dtype=float)[faces.reshape(-1)]
+    tri_uv = np.asarray(uv, dtype=float)[faces.reshape(-1)]
+
+    tri_uv = tri_uv.reshape(-1, 3, 2)
+    u = tri_uv[:, :, 0]
+    wraps = (np.max(u, axis=1, keepdims=True) - np.min(u, axis=1, keepdims=True)) > 0.5
+    adjust = wraps & (u < 0.5)
+    u = np.where(adjust, u + 1.0, u)
+    tri_uv[:, :, 0] = u
+    tri_uv = tri_uv.reshape(-1, 2)
+
+    n_tri = int(faces.shape[0])
+    tri_faces = np.arange(n_tri * 3, dtype=np.int32).reshape(n_tri, 3)
+    return tri_pts.astype(np.float32), tri_faces.astype(np.int32), tri_uv.astype(np.float32)
+
+
 def main() -> None:
     args = _parse_args()
     npz_path = _resolve_input(Path(args.input))
@@ -242,9 +263,10 @@ def main() -> None:
     except Exception as exc:
         raise RuntimeError("pyvista required: pip install pyvista") from exc
 
-    face_cells = np.hstack([np.full((faces.shape[0], 1), 3, dtype=np.int32), faces]).ravel()
-    mesh = pv.PolyData(verts.astype(np.float32), face_cells.astype(np.int32))
-    mesh.active_texture_coordinates = uv.astype(np.float32)
+    tri_pts, tri_faces, tri_uv = _expand_faces_with_seam_fix(verts, faces, uv)
+    face_cells = np.hstack([np.full((tri_faces.shape[0], 1), 3, dtype=np.int32), tri_faces]).ravel()
+    mesh = pv.PolyData(tri_pts, face_cells.astype(np.int32))
+    mesh.active_texture_coordinates = tri_uv
     tex = pv.read_texture(str(args.image))
     try:
         tex.repeat = True
