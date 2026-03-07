@@ -36,7 +36,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sky-opacity", type=float, default=0.50)
     p.add_argument("--show-edges", action="store_true", default=True)
-    p.add_argument("--show-reference-spheres", action="store_true")
     return p.parse_args()
 
 
@@ -287,20 +286,14 @@ def main() -> None:
         lighting=False,
     )
 
-    if bool(args.show_reference_spheres):
-        p.add_mesh(pv.Sphere(radius=float(rs), center=(0.0, 0.0, 0.0)), style="wireframe", color="#808080", opacity=0.5)
-        p.add_mesh(
-            pv.Sphere(radius=float(1.5 * rs), center=(0.0, 0.0, 0.0)),
-            style="wireframe",
-            color="#b0c4de",
-            opacity=0.4,
-        )
-        p.add_mesh(
-            pv.Sphere(radius=float(np.linalg.norm(a)), center=(0.0, 0.0, 0.0)),
-            style="wireframe",
-            color="#3a6ea5",
-            opacity=0.2,
-        )
+    # Black-hole reference spheres (always on): horizon and photon sphere.
+    p.add_mesh(pv.Sphere(radius=float(rs), center=(0.0, 0.0, 0.0)), style="wireframe", color="#808080", opacity=0.5)
+    p.add_mesh(
+        pv.Sphere(radius=float(1.5 * rs), center=(0.0, 0.0, 0.0)),
+        style="wireframe",
+        color="#b0c4de",
+        opacity=0.4,
+    )
 
     p.add_points(observer.reshape(1, 3), color="#ff44cc", point_size=16, render_points_as_spheres=True)
     p.add_points(a.reshape(1, 3), color="#6fb8ff", point_size=14, render_points_as_spheres=True)
