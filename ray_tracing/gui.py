@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 import numpy as np
-from matplotlib import cm
+from matplotlib import cm, colors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
@@ -57,6 +57,7 @@ class RayTracingGUI:
         self.interp_theta_max_deg_var = tk.StringVar(value="360")
         self.interp_theta_count_var = tk.StringVar(value="36")
         self.heatmap_res_mult_var = tk.StringVar(value="10")
+        self.interp_vec_res_mult_var = tk.StringVar(value="1")
         self.interp_file_path_var = tk.StringVar(value=str(self.INTERP_TABLE_DEFAULT_PATH))
         self.show_ticks_var = tk.BooleanVar(value=True)
         self.show_lookback_vec_var = tk.BooleanVar(value=False)
@@ -124,6 +125,8 @@ class RayTracingGUI:
         ttk.Entry(frame, textvariable=self.interp_theta_count_var, width=10).grid(row=14, column=5, sticky="w", padx=5)
         ttk.Label(frame, text="Heatmap Res x").grid(row=13, column=6, sticky="w", padx=5, pady=4)
         ttk.Entry(frame, textvariable=self.heatmap_res_mult_var, width=10).grid(row=14, column=6, sticky="w", padx=5)
+        ttk.Label(frame, text="Vector Res x").grid(row=15, column=6, sticky="w", padx=5, pady=4)
+        ttk.Entry(frame, textvariable=self.interp_vec_res_mult_var, width=10).grid(row=16, column=6, sticky="w", padx=5)
         ttk.Label(frame, text="Interp File").grid(row=13, column=7, sticky="w", padx=5, pady=4)
         ttk.Entry(frame, textvariable=self.interp_file_path_var, width=24).grid(row=14, column=7, columnspan=2, sticky="w", padx=5)
         ttk.Button(frame, text="Build Table", command=self._build_interp_table_from_saved_sequences).grid(row=13, column=8, sticky="w", padx=8)
@@ -135,7 +138,7 @@ class RayTracingGUI:
         )
 
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frame, textvariable=self.status_var).grid(row=16, column=0, columnspan=9, sticky="w", padx=5, pady=(8, 0))
+        ttk.Label(frame, textvariable=self.status_var).grid(row=17, column=0, columnspan=9, sticky="w", padx=5, pady=(8, 0))
 
         self._load_defaults()
 
@@ -726,11 +729,15 @@ class RayTracingGUI:
             return
         try:
             bx_rs = float(self.bx_rs_var.get().strip())
+            vec_res_mult = int(self.interp_vec_res_mult_var.get().strip())
         except ValueError:
-            messagebox.showerror("Input Error", "Observer B x-position must be a valid number.")
+            messagebox.showerror("Input Error", "Observer B x-position and Vector Res x must be valid numbers.")
             return
         if bx_rs <= 1.0:
             messagebox.showerror("Input Error", "Observer B x-position must be > 1 Rs.")
+            return
+        if vec_res_mult < 1:
+            messagebox.showerror("Input Error", "Vector Res x must be >= 1.")
             return
 
         try:
@@ -750,15 +757,44 @@ class RayTracingGUI:
         bi = int(np.argmin(np.abs(b_values - bx_rs)))
         b_used = float(b_values[bi])
 
-        th_rad = np.deg2rad(theta_values_deg)
-        rr = np.asarray(r_values, dtype=float)
-        th_mesh, r_mesh = np.meshgrid(th_rad, rr, indexing="xy")
-        x = r_mesh * np.cos(th_mesh)
-        y = r_mesh * np.sin(th_mesh)
-
         u = np.asarray(prop_dir[bi, :, :, 0], dtype=float)
         v = np.asarray(prop_dir[bi, :, :, 1], dtype=float)
         ok = np.asarray(valid[bi], dtype=bool) & np.isfinite(u) & np.isfinite(v)
+
+        rr = np.asarray(r_values, dtype=float)
+        tt = np.asarray(theta_values_deg, dtype=float)
+        if vec_res_mult > 1:
+            rr_dense = np.linspace(float(rr[0]), float(rr[-1]), max(2, int(rr.size) * vec_res_mult), dtype=float)
+            tt_dense = np.linspace(float(tt[0]), float(tt[-1]), max(2, int(tt.size) * vec_res_mult), dtype=float)
+            u = self._resample_masked_grid(
+                z=u,
+                valid=ok,
+                r_old=rr,
+                th_old=tt,
+                r_new=rr_dense,
+                th_new=tt_dense,
+                periodic_theta=False,
+            )
+            v = self._resample_masked_grid(
+                z=v,
+                valid=ok,
+                r_old=rr,
+                th_old=tt,
+                r_new=rr_dense,
+                th_new=tt_dense,
+                periodic_theta=False,
+            )
+            mag = np.hypot(u, v)
+            ok = np.isfinite(u) & np.isfinite(v) & np.isfinite(mag) & (mag > 1e-9)
+            u = np.where(ok, u / np.where(ok, mag, 1.0), np.nan)
+            v = np.where(ok, v / np.where(ok, mag, 1.0), np.nan)
+            rr = rr_dense
+            tt = tt_dense
+
+        th_rad = np.deg2rad(tt)
+        th_mesh, r_mesh = np.meshgrid(th_rad, rr, indexing="xy")
+        x = r_mesh * np.cos(th_mesh)
+        y = r_mesh * np.sin(th_mesh)
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -767,18 +803,28 @@ class RayTracingGUI:
         ax.scatter([bx_rs], [0.0], s=35, color="tab:red", label="Observer B")
 
         if np.any(ok):
-            ax.quiver(
+            cvals = np.asarray(np.rad2deg(th_mesh), dtype=float)
+            cmax = max(360.0, float(np.nanmax(cvals[ok])) if np.any(ok) else 360.0)
+            rb_nowhite = colors.LinearSegmentedColormap.from_list(
+                "rb_nowhite",
+                ["#d7191c", "#7b3294", "#2c7bb6"],
+            )
+            q = ax.quiver(
                 x[ok],
                 y[ok],
                 u[ok],
                 v[ok],
+                cvals[ok],
                 angles="xy",
                 scale_units="xy",
                 scale=1.0,
-                color="tab:blue",
+                cmap=rb_nowhite,
+                norm=colors.Normalize(vmin=0.0, vmax=cmax),
                 width=0.003,
                 alpha=0.9,
             )
+            cbar = self.fig.colorbar(q, ax=ax)
+            cbar.set_label("theta (deg, unwrapped)")
 
         ax.set_title(f"Propagation Unit Vectors | requested B={bx_rs:.3g} Rs, using table B={b_used:.3g} Rs")
         ax.set_xlabel("x / Rs")
@@ -793,7 +839,7 @@ class RayTracingGUI:
         total = int(ok.size)
         self.status_var.set(
             f"prop vectors plotted from {interp_file} | requested B={bx_rs:.6g} Rs, "
-            f"using B[{bi}]={b_used:.6g} Rs | valid={valid_count}/{total}"
+            f"using B[{bi}]={b_used:.6g} Rs | valid={valid_count}/{total} | res x{vec_res_mult}"
         )
 
     @staticmethod
@@ -1244,6 +1290,7 @@ class RayTracingGUI:
             "interp_theta_max_deg": self.interp_theta_max_deg_var.get().strip(),
             "interp_theta_count": self.interp_theta_count_var.get().strip(),
             "heatmap_res_mult": self.heatmap_res_mult_var.get().strip(),
+            "interp_vec_res_mult": self.interp_vec_res_mult_var.get().strip(),
             "interp_file_path": self.interp_file_path_var.get().strip(),
             "show_ticks": bool(self.show_ticks_var.get()),
             "show_lookback_vec": bool(self.show_lookback_vec_var.get()),
@@ -1286,6 +1333,7 @@ class RayTracingGUI:
             ("interp_theta_max_deg", self.interp_theta_max_deg_var),
             ("interp_theta_count", self.interp_theta_count_var),
             ("heatmap_res_mult", self.heatmap_res_mult_var),
+            ("interp_vec_res_mult", self.interp_vec_res_mult_var),
             ("interp_file_path", self.interp_file_path_var),
         ]
         for key, var in mapping:
