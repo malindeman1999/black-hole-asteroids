@@ -29,3 +29,9 @@ Thumbs.db
 
 # Local runtime outputs
 *.log
+
+# Generated simulation artifacts (do not commit)
+data/*.npz
+data/*.pdf
+tests/*.npz
+tests/*.png
