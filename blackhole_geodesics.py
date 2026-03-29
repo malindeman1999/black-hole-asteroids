@@ -569,11 +569,54 @@ class SchwarzschildBlackHole:
                 a, fa = m, fm
         return 0.5 * (a + b)
 
-    def _solve_for_target_azimuth(self, r1: float, r2: float, target: float, use_gpu: bool = True) -> List[Tuple[float, float, str]]:
+    def _solve_for_target_azimuth(
+        self,
+        r1: float,
+        r2: float,
+        target: float,
+        use_gpu: bool = True,
+        warm_start_impact_parameter_m: float | None = None,
+        warm_start_branch: str | None = None,
+        warm_start_window_rel: float = 0.12,
+    ) -> List[Tuple[float, float, str]]:
         rs = self.schwarzschild_radius_m
         rmin = min(r1, r2)
         rmax = max(r1, r2)
         solutions: List[Tuple[float, float, str]] = []
+
+        def _warm_bisect(
+            func: Callable[[float], float],
+            lo: float,
+            hi: float,
+            warm_center: float | None,
+        ) -> float:
+            if warm_center is None or not np.isfinite(float(warm_center)):
+                return self._find_root_bisection(func, lo, hi)
+            c = float(np.clip(float(warm_center), lo, hi))
+            span = max(abs(c) * float(warm_start_window_rel), 8.0 * self.numeric_tol * rs)
+            max_span = max(hi - lo, span)
+            for _ in range(7):
+                a = max(lo, c - span)
+                b = min(hi, c + span)
+                if b > a:
+                    try:
+                        fa = float(func(a))
+                        fb = float(func(b))
+                        if np.isfinite(fa) and np.isfinite(fb) and (fa == 0.0 or fb == 0.0 or fa * fb <= 0.0):
+                            return self._find_root_bisection(func, a, b)
+                    except Exception:
+                        pass
+                if span >= max_span:
+                    break
+                span = min(max_span, span * 2.0)
+            return self._find_root_bisection(func, lo, hi)
+
+        warm_b = (
+            float(abs(float(warm_start_impact_parameter_m)))
+            if warm_start_impact_parameter_m is not None and np.isfinite(float(warm_start_impact_parameter_m))
+            else None
+        )
+        warm_branch = str(warm_start_branch) if warm_start_branch is not None else None
 
         # Monotonic branch
         if rmin > rs:
@@ -588,7 +631,8 @@ class SchwarzschildBlackHole:
                 phi_hi = self._delta_phi_mono(r1, r2, b_hi, use_gpu=use_gpu)
                 if 0.0 <= target <= phi_hi:
                     f = lambda b: self._delta_phi_mono(r1, r2, b, use_gpu=use_gpu) - target
-                    b_star = self._find_root_bisection(f, b_lo, b_hi)
+                    warm_mono = warm_b if (warm_branch is None or warm_branch == "monotonic") else None
+                    b_star = _warm_bisect(f, b_lo, b_hi, warm_mono)
                     t_star = self._time_mono(r1, r2, b_star, use_gpu=use_gpu)
                     solutions.append((b_star, t_star, "monotonic"))
             except Exception:
@@ -605,7 +649,20 @@ class SchwarzschildBlackHole:
                 phi_max, _, _ = self._delta_phi_turning(r1, r2, rp_lo, use_gpu=use_gpu)
                 if phi_min <= target <= phi_max:
                     f = lambda rp: self._delta_phi_turning(r1, r2, rp, use_gpu=use_gpu)[0] - target
-                    rp_star = self._find_root_bisection(f, rp_hi, rp_lo)
+                    warm_rp = None
+                    if warm_b is not None and (warm_branch is None or warm_branch == "turning"):
+                        def _b_of_rp(rp: float) -> float:
+                            return float(rp / sqrt(max(1.0 - rs / rp, self.numeric_tol)))
+
+                        b_lo_turn = _b_of_rp(rp_lo)
+                        b_hi_turn = _b_of_rp(rp_hi)
+                        if b_lo_turn <= warm_b <= b_hi_turn:
+                            try:
+                                g = lambda rp: _b_of_rp(float(rp)) - warm_b
+                                warm_rp = self._find_root_bisection(g, rp_lo, rp_hi)
+                            except Exception:
+                                warm_rp = None
+                    rp_star = _warm_bisect(f, rp_hi, rp_lo, warm_rp)
                     _, t_star, b_star = self._delta_phi_turning(r1, r2, rp_star, use_gpu=use_gpu)
                     solutions.append((b_star, t_star, "turning"))
             except Exception:
@@ -865,6 +922,87 @@ class SchwarzschildBlackHole:
             lag_between_fastest_two_s=lag,
         )
 
+    def find_all_geodesic_candidates(
+        self,
+        point_a: Sequence[float],
+        point_b: Sequence[float],
+        a_before_b: bool = True,
+        use_gpu: bool = True,
+        warm_start_impact_parameter_m: float | None = None,
+        warm_start_branch: str | None = None,
+    ) -> GeodesicResult:
+        ax, ay, az = float(point_a[0]), float(point_a[1]), float(point_a[2])
+        bx, by, bz = float(point_b[0]), float(point_b[1]), float(point_b[2])
+
+        if a_before_b:
+            sx, sy, sz = ax, ay, az
+            ex, ey, ez = bx, by, bz
+            b_before_a = False
+        else:
+            sx, sy, sz = bx, by, bz
+            ex, ey, ez = ax, ay, az
+            b_before_a = True
+
+        r1 = sqrt(sx * sx + sy * sy + sz * sz)
+        r2 = sqrt(ex * ex + ey * ey + ez * ez)
+        rs = self.schwarzschild_radius_m
+        if r1 <= rs or r2 <= rs:
+            raise ValueError("Points must be outside the event horizon.")
+
+        dot = sx * ex + sy * ey + sz * ez
+        gamma = acos(_clamp(dot / (r1 * r2), -1.0, 1.0))
+        angular_targets = [(+1, gamma), (-1, 2.0 * pi - gamma)]
+        candidates: List[GeodesicSolution] = []
+
+        for direction, target in angular_targets:
+            if target <= 1e-12:
+                continue
+            for impact_b, travel_time, branch in self._solve_for_target_azimuth(
+                r1,
+                r2,
+                target,
+                use_gpu=use_gpu,
+                warm_start_impact_parameter_m=warm_start_impact_parameter_m,
+                warm_start_branch=warm_start_branch,
+            ):
+                candidates.append(
+                    GeodesicSolution(
+                        direction=direction,
+                        target_azimuth_rad=target,
+                        impact_parameter_m=impact_b,
+                        travel_time_s=travel_time,
+                        branch=branch,
+                    )
+                )
+
+        if not candidates:
+            raise RuntimeError("No geodesic solution found for the requested points.")
+
+        dedup: List[GeodesicSolution] = []
+        for c in sorted(candidates, key=lambda s: s.travel_time_s):
+            if not dedup:
+                dedup.append(c)
+                continue
+            prev = dedup[-1]
+            rel_b = abs((c.impact_parameter_m - prev.impact_parameter_m) / max(1.0, abs(c.impact_parameter_m)))
+            if rel_b > 1e-6 or c.direction != prev.direction:
+                dedup.append(c)
+
+        lag = 0.0
+        if len(dedup) >= 2:
+            lag = dedup[1].travel_time_s - dedup[0].travel_time_s
+
+        return GeodesicResult(
+            point_a=(ax, ay, az),
+            point_b=(bx, by, bz),
+            start_point=(sx, sy, sz),
+            end_point=(ex, ey, ez),
+            b_before_a=b_before_a,
+            separation_angle_rad=gamma,
+            paths=tuple(dedup),
+            lag_between_fastest_two_s=lag,
+        )
+
     def find_two_shortest_geodesics_batch(
         self,
         point_pairs: Sequence[Tuple[Sequence[float], Sequence[float]]],
@@ -893,6 +1031,31 @@ class SchwarzschildBlackHole:
         if backend == "process":
             with ProcessPoolExecutor(max_workers=max_workers) as pool:
                 return list(pool.map(_solve_pair_worker, tasks))
+        raise ValueError("backend must be one of: 'process', 'thread', 'serial'")
+
+    def find_all_geodesic_candidates_batch(
+        self,
+        point_pairs: Sequence[Tuple[Sequence[float], Sequence[float]]],
+        a_before_b: bool = True,
+        max_workers: int | None = None,
+        backend: Literal["process", "thread", "serial"] = "process",
+        use_gpu: bool = True,
+    ) -> List[GeodesicResult]:
+        pairs = list(point_pairs)
+        if not pairs:
+            return []
+        if use_gpu and cp is not None:
+            return self._find_all_geodesic_candidates_batch_gpu(pairs, a_before_b=a_before_b)
+        if len(pairs) == 1 or backend == "serial":
+            return [self.find_all_geodesic_candidates(a, b, a_before_b=a_before_b, use_gpu=use_gpu) for a, b in pairs]
+
+        tasks = [(self, pair[0], pair[1], a_before_b, use_gpu) for pair in pairs]
+        if backend == "thread":
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                return list(pool.map(_solve_pair_all_worker, tasks))
+        if backend == "process":
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                return list(pool.map(_solve_pair_all_worker, tasks))
         raise ValueError("backend must be one of: 'process', 'thread', 'serial'")
 
     def _find_two_shortest_geodesics_batch_gpu(
@@ -1014,6 +1177,121 @@ class SchwarzschildBlackHole:
                     b_before_a=b_before_a,
                     separation_angle_rad=float(gamma[i]),
                     paths=top2,
+                    lag_between_fastest_two_s=float(lag),
+                )
+            )
+
+        return results
+
+    def _find_all_geodesic_candidates_batch_gpu(
+        self,
+        point_pairs: Sequence[Tuple[Sequence[float], Sequence[float]]],
+        a_before_b: bool = True,
+    ) -> List[GeodesicResult]:
+        xp = cp
+        n = len(point_pairs)
+        ax = np.asarray([float(p[0][0]) for p in point_pairs], dtype=float)
+        ay = np.asarray([float(p[0][1]) for p in point_pairs], dtype=float)
+        az = np.asarray([float(p[0][2]) for p in point_pairs], dtype=float)
+        bx = np.asarray([float(p[1][0]) for p in point_pairs], dtype=float)
+        by = np.asarray([float(p[1][1]) for p in point_pairs], dtype=float)
+        bz = np.asarray([float(p[1][2]) for p in point_pairs], dtype=float)
+
+        if a_before_b:
+            sx, sy, sz = ax, ay, az
+            ex, ey, ez = bx, by, bz
+            b_before_a = False
+        else:
+            sx, sy, sz = bx, by, bz
+            ex, ey, ez = ax, ay, az
+            b_before_a = True
+
+        r1 = np.sqrt(sx * sx + sy * sy + sz * sz)
+        r2 = np.sqrt(ex * ex + ey * ey + ez * ez)
+        rs = self.schwarzschild_radius_m
+        if np.any(r1 <= rs) or np.any(r2 <= rs):
+            raise ValueError("Points must be outside the event horizon.")
+
+        dot = sx * ex + sy * ey + sz * ez
+        gamma = np.arccos(np.clip(dot / (r1 * r2), -1.0, 1.0))
+        target_short = gamma
+        target_long = 2.0 * np.pi - gamma
+
+        b_m1, t_m1, ok_m1, b_t1, t_t1, ok_t1 = self._solve_target_batch_gpu(r1, r2, target_short, xp)
+        b_m2, t_m2, ok_m2, b_t2, t_t2, ok_t2 = self._solve_target_batch_gpu(r1, r2, target_long, xp)
+
+        results: List[GeodesicResult] = []
+        for i in range(n):
+            candidates: List[GeodesicSolution] = []
+            if target_short[i] > 1e-12:
+                if ok_m1[i]:
+                    candidates.append(
+                        GeodesicSolution(
+                            direction=+1,
+                            target_azimuth_rad=float(target_short[i]),
+                            impact_parameter_m=float(b_m1[i]),
+                            travel_time_s=float(t_m1[i]),
+                            branch="monotonic",
+                        )
+                    )
+                if ok_t1[i]:
+                    candidates.append(
+                        GeodesicSolution(
+                            direction=+1,
+                            target_azimuth_rad=float(target_short[i]),
+                            impact_parameter_m=float(b_t1[i]),
+                            travel_time_s=float(t_t1[i]),
+                            branch="turning",
+                        )
+                    )
+            if target_long[i] > 1e-12:
+                if ok_m2[i]:
+                    candidates.append(
+                        GeodesicSolution(
+                            direction=-1,
+                            target_azimuth_rad=float(target_long[i]),
+                            impact_parameter_m=float(b_m2[i]),
+                            travel_time_s=float(t_m2[i]),
+                            branch="monotonic",
+                        )
+                    )
+                if ok_t2[i]:
+                    candidates.append(
+                        GeodesicSolution(
+                            direction=-1,
+                            target_azimuth_rad=float(target_long[i]),
+                            impact_parameter_m=float(b_t2[i]),
+                            travel_time_s=float(t_t2[i]),
+                            branch="turning",
+                        )
+                    )
+
+            dedup: List[GeodesicSolution] = []
+            for c in sorted(candidates, key=lambda s: s.travel_time_s):
+                if not dedup:
+                    dedup.append(c)
+                    continue
+                prev = dedup[-1]
+                rel_b = abs((c.impact_parameter_m - prev.impact_parameter_m) / max(1.0, abs(c.impact_parameter_m)))
+                if rel_b > 1e-6 or c.direction != prev.direction:
+                    dedup.append(c)
+
+            if not dedup:
+                raise RuntimeError("No geodesic solution found for the requested points.")
+
+            lag = 0.0
+            if len(dedup) >= 2:
+                lag = dedup[1].travel_time_s - dedup[0].travel_time_s
+
+            results.append(
+                GeodesicResult(
+                    point_a=(float(ax[i]), float(ay[i]), float(az[i])),
+                    point_b=(float(bx[i]), float(by[i]), float(bz[i])),
+                    start_point=(float(sx[i]), float(sy[i]), float(sz[i])),
+                    end_point=(float(ex[i]), float(ey[i]), float(ez[i])),
+                    b_before_a=b_before_a,
+                    separation_angle_rad=float(gamma[i]),
+                    paths=tuple(dedup),
                     lag_between_fastest_two_s=float(lag),
                 )
             )
@@ -1146,6 +1424,11 @@ class SchwarzschildBlackHole:
 def _solve_pair_worker(task: Tuple[SchwarzschildBlackHole, Sequence[float], Sequence[float], bool, bool]) -> GeodesicResult:
     bh, point_a, point_b, a_before_b, use_gpu = task
     return bh.find_two_shortest_geodesics(point_a, point_b, a_before_b=a_before_b, use_gpu=use_gpu)
+
+
+def _solve_pair_all_worker(task: Tuple[SchwarzschildBlackHole, Sequence[float], Sequence[float], bool, bool]) -> GeodesicResult:
+    bh, point_a, point_b, a_before_b, use_gpu = task
+    return bh.find_all_geodesic_candidates(point_a, point_b, a_before_b=a_before_b, use_gpu=use_gpu)
 
 
 if __name__ == "__main__":

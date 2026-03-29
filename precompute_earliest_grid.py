@@ -40,6 +40,10 @@ class PrecomputedEarliestInterpolator:
         gamma_b_minus_3d: np.ndarray,
         gamma_a_plus_3d: np.ndarray,
         gamma_a_minus_3d: np.ndarray,
+        dir_b_plus_local_4d: np.ndarray,
+        dir_b_minus_local_4d: np.ndarray,
+        dir_a_plus_local_4d: np.ndarray,
+        dir_a_minus_local_4d: np.ndarray,
         ok_plus_3d: np.ndarray,
         ok_minus_3d: np.ndarray,
         metadata: Dict[str, object] | None = None,
@@ -54,16 +58,23 @@ class PrecomputedEarliestInterpolator:
         self.gamma_b_minus_3d = np.asarray(gamma_b_minus_3d, dtype=float)
         self.gamma_a_plus_3d = np.asarray(gamma_a_plus_3d, dtype=float)
         self.gamma_a_minus_3d = np.asarray(gamma_a_minus_3d, dtype=float)
+        self.dir_b_plus_local_4d = np.asarray(dir_b_plus_local_4d, dtype=float)
+        self.dir_b_minus_local_4d = np.asarray(dir_b_minus_local_4d, dtype=float)
+        self.dir_a_plus_local_4d = np.asarray(dir_a_plus_local_4d, dtype=float)
+        self.dir_a_minus_local_4d = np.asarray(dir_a_minus_local_4d, dtype=float)
         self.ok_plus_3d = np.asarray(ok_plus_3d, dtype=bool)
         self.ok_minus_3d = np.asarray(ok_minus_3d, dtype=bool)
         self.metadata = dict(metadata or {})
 
         if self.a_r_m.ndim != 1 or self.a_phi_rad.ndim != 1 or self.b_r_m.ndim != 1:
             raise ValueError("Expected 1D coordinate axes for a_r_m, a_phi_rad, and b_r_m.")
-        if self.a_r_m.size < 2 or self.a_phi_rad.size < 2 or self.b_r_m.size < 2:
-            raise ValueError("Interpolation requires at least 2 samples along each axis.")
+        if self.a_phi_rad.size < 2 or self.b_r_m.size < 2:
+            raise ValueError("Interpolation requires at least 2 samples for A-phi and B-r axes.")
+        if self.a_r_m.size < 1:
+            raise ValueError("Interpolation requires at least 1 sample for A-r axis.")
 
         expected_shape = (self.b_r_m.size, self.a_r_m.size, self.a_phi_rad.size)
+        expected_vec_shape = expected_shape + (2,)
         for name, arr in [
             ("dt_plus_3d", self.dt_plus_3d),
             ("dt_minus_3d", self.dt_minus_3d),
@@ -76,6 +87,14 @@ class PrecomputedEarliestInterpolator:
         ]:
             if arr.shape != expected_shape:
                 raise ValueError(f"{name} shape {arr.shape} does not match expected {expected_shape}.")
+        for name, arr in [
+            ("dir_b_plus_local_4d", self.dir_b_plus_local_4d),
+            ("dir_b_minus_local_4d", self.dir_b_minus_local_4d),
+            ("dir_a_plus_local_4d", self.dir_a_plus_local_4d),
+            ("dir_a_minus_local_4d", self.dir_a_minus_local_4d),
+        ]:
+            if arr.shape != expected_vec_shape:
+                raise ValueError(f"{name} shape {arr.shape} does not match expected {expected_vec_shape}.")
 
         # A-phi grid is expected regular over [-pi, pi) from precompute.
         self._phi0 = float(self.a_phi_rad[0])
@@ -94,6 +113,10 @@ class PrecomputedEarliestInterpolator:
             "delta_t_minus_s",
             "gamma_at_b_plus_rad",
             "gamma_at_b_minus_rad",
+            "dir_at_b_plus_local_xy",
+            "dir_at_b_minus_local_xy",
+            "dir_at_a_plus_local_xy",
+            "dir_at_a_minus_local_xy",
             "ok_plus",
             "ok_minus",
         ]
@@ -117,12 +140,25 @@ class PrecomputedEarliestInterpolator:
                 raise ValueError(f"{name} has shape {arr2.shape}, expected {(n_b, n_a)}")
             return arr2.reshape(n_b, n_ar, n_ap)
 
+        def _reshape4(name: str, arr: np.ndarray) -> np.ndarray:
+            arr2 = np.asarray(arr)
+            if arr2.ndim != 3:
+                raise ValueError(f"{name} expected 3D array [n_b, n_a, 2], got shape {arr2.shape}")
+            if arr2.shape != (n_b, n_a, 2):
+                raise ValueError(f"{name} has shape {arr2.shape}, expected {(n_b, n_a, 2)}")
+            return arr2.reshape(n_b, n_ar, n_ap, 2)
+
         metadata = {}
         if "metadata_json" in data:
             try:
                 metadata = json.loads(str(data["metadata_json"].item()))
             except Exception:
                 metadata = {}
+
+        dir_b_plus = _reshape4("dir_at_b_plus_local_xy", data["dir_at_b_plus_local_xy"])
+        dir_b_minus = _reshape4("dir_at_b_minus_local_xy", data["dir_at_b_minus_local_xy"])
+        dir_a_plus = _reshape4("dir_at_a_plus_local_xy", data["dir_at_a_plus_local_xy"])
+        dir_a_minus = _reshape4("dir_at_a_minus_local_xy", data["dir_at_a_minus_local_xy"])
 
         return cls(
             rs_m=float(data["rs_m"]),
@@ -143,12 +179,21 @@ class PrecomputedEarliestInterpolator:
                 if "gamma_at_a_minus_rad" in data
                 else np.full((n_b, n_ar, n_ap), np.nan, dtype=float)
             ),
+            dir_b_plus_local_4d=dir_b_plus,
+            dir_b_minus_local_4d=dir_b_minus,
+            dir_a_plus_local_4d=dir_a_plus,
+            dir_a_minus_local_4d=dir_a_minus,
             ok_plus_3d=_reshape3("ok_plus", data["ok_plus"]).astype(bool),
             ok_minus_3d=_reshape3("ok_minus", data["ok_minus"]).astype(bool),
             metadata=metadata,
         )
 
     def _interp_axis_indices(self, x, axis, xp):
+        if int(axis.size) == 1:
+            i0 = xp.zeros_like(x, dtype=int)
+            i1 = xp.zeros_like(x, dtype=int)
+            w = xp.zeros_like(x, dtype=float)
+            return i0, i1, w
         x_clamped = xp.clip(x, axis[0], axis[-1])
         i0 = xp.searchsorted(axis, x_clamped, side="right") - 1
         i0 = xp.clip(i0, 0, axis.size - 2)
@@ -220,6 +265,20 @@ class PrecomputedEarliestInterpolator:
         ok = wsum > 0.0
         return out, ok
 
+    @staticmethod
+    def _masked_trilinear_vec2(arr4, ok3, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp):
+        vx, okx = PrecomputedEarliestInterpolator._masked_trilinear(
+            arr4[..., 0], ok3, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp
+        )
+        vy, oky = PrecomputedEarliestInterpolator._masked_trilinear(
+            arr4[..., 1], ok3, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp
+        )
+        vv = xp.stack([vx, vy], axis=1)
+        nv = xp.sqrt(xp.sum(vv * vv, axis=1))
+        good = okx & oky & (nv > 0.0) & xp.all(xp.isfinite(vv), axis=1)
+        vv = xp.where(good[:, None], vv / xp.maximum(nv[:, None], 1e-12), xp.nan)
+        return vv, good
+
     def prepare_backend(self, use_gpu: bool = True) -> str:
         """
         Materialize interpolation tables on the selected backend once.
@@ -239,6 +298,10 @@ class PrecomputedEarliestInterpolator:
             "gb_m": xp.asarray(self.gamma_b_minus_3d, dtype=float),
             "ga_p": xp.asarray(self.gamma_a_plus_3d, dtype=float),
             "ga_m": xp.asarray(self.gamma_a_minus_3d, dtype=float),
+            "db_p": xp.asarray(self.dir_b_plus_local_4d, dtype=float),
+            "db_m": xp.asarray(self.dir_b_minus_local_4d, dtype=float),
+            "da_p": xp.asarray(self.dir_a_plus_local_4d, dtype=float),
+            "da_m": xp.asarray(self.dir_a_minus_local_4d, dtype=float),
             "ok_p": xp.asarray(self.ok_plus_3d, dtype=bool),
             "ok_m": xp.asarray(self.ok_minus_3d, dtype=bool),
         }
@@ -283,6 +346,10 @@ class PrecomputedEarliestInterpolator:
         gb_m = bt["gb_m"]
         ga_p = bt["ga_p"]
         ga_m = bt["ga_m"]
+        db_p = bt["db_p"]
+        db_m = bt["db_m"]
+        da_p = bt["da_p"]
+        da_m = bt["da_m"]
         ok_p = bt["ok_p"]
         ok_m = bt["ok_m"]
 
@@ -292,6 +359,10 @@ class PrecomputedEarliestInterpolator:
         out_gb_m = np.full(n, np.nan, dtype=float)
         out_ga_p = np.full(n, np.nan, dtype=float)
         out_ga_m = np.full(n, np.nan, dtype=float)
+        out_db_p = np.full((n, 2), np.nan, dtype=float)
+        out_db_m = np.full((n, 2), np.nan, dtype=float)
+        out_da_p = np.full((n, 2), np.nan, dtype=float)
+        out_da_m = np.full((n, 2), np.nan, dtype=float)
         out_ok_p = np.zeros(n, dtype=bool)
         out_ok_m = np.zeros(n, dtype=bool)
 
@@ -313,6 +384,10 @@ class PrecomputedEarliestInterpolator:
             gbm_chunk, _ = self._masked_trilinear(gb_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
             gap_chunk, _ = self._masked_trilinear(ga_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
             gam_chunk, _ = self._masked_trilinear(ga_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dbp_chunk, _ = self._masked_trilinear_vec2(db_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dbm_chunk, _ = self._masked_trilinear_vec2(db_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dap_chunk, _ = self._masked_trilinear_vec2(da_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dam_chunk, _ = self._masked_trilinear_vec2(da_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
 
             if xp is np:
                 out_dt_p[lo:hi] = dtp_chunk
@@ -321,6 +396,10 @@ class PrecomputedEarliestInterpolator:
                 out_gb_m[lo:hi] = gbm_chunk
                 out_ga_p[lo:hi] = gap_chunk
                 out_ga_m[lo:hi] = gam_chunk
+                out_db_p[lo:hi] = dbp_chunk
+                out_db_m[lo:hi] = dbm_chunk
+                out_da_p[lo:hi] = dap_chunk
+                out_da_m[lo:hi] = dam_chunk
                 out_ok_p[lo:hi] = okp_chunk
                 out_ok_m[lo:hi] = okm_chunk
             else:
@@ -330,6 +409,10 @@ class PrecomputedEarliestInterpolator:
                 out_gb_m[lo:hi] = xp.asnumpy(gbm_chunk)
                 out_ga_p[lo:hi] = xp.asnumpy(gap_chunk)
                 out_ga_m[lo:hi] = xp.asnumpy(gam_chunk)
+                out_db_p[lo:hi] = xp.asnumpy(dbp_chunk)
+                out_db_m[lo:hi] = xp.asnumpy(dbm_chunk)
+                out_da_p[lo:hi] = xp.asnumpy(dap_chunk)
+                out_da_m[lo:hi] = xp.asnumpy(dam_chunk)
                 out_ok_p[lo:hi] = xp.asnumpy(okp_chunk)
                 out_ok_m[lo:hi] = xp.asnumpy(okm_chunk)
 
@@ -348,6 +431,10 @@ class PrecomputedEarliestInterpolator:
             "gamma_at_b_minus_rad": out_gb_m,
             "gamma_at_a_plus_rad": out_ga_p,
             "gamma_at_a_minus_rad": out_ga_m,
+            "dir_at_b_plus_local_xy": out_db_p,
+            "dir_at_b_minus_local_xy": out_db_m,
+            "dir_at_a_plus_local_xy": out_da_p,
+            "dir_at_a_minus_local_xy": out_da_m,
             "ok_plus": out_ok_p,
             "ok_minus": out_ok_m,
             "ok_both": ok_both,
@@ -396,6 +483,10 @@ class PrecomputedEarliestInterpolator:
         gb_m = bt["gb_m"]
         ga_p = bt["ga_p"]
         ga_m = bt["ga_m"]
+        db_p = bt["db_p"]
+        db_m = bt["db_m"]
+        da_p = bt["da_p"]
+        da_m = bt["da_m"]
         ok_p = bt["ok_p"]
         ok_m = bt["ok_m"]
 
@@ -405,6 +496,10 @@ class PrecomputedEarliestInterpolator:
         out_gb_m = np.full(n, np.nan, dtype=float)
         out_ga_p = np.full(n, np.nan, dtype=float)
         out_ga_m = np.full(n, np.nan, dtype=float)
+        out_db_p = np.full((n, 2), np.nan, dtype=float)
+        out_db_m = np.full((n, 2), np.nan, dtype=float)
+        out_da_p = np.full((n, 2), np.nan, dtype=float)
+        out_da_m = np.full((n, 2), np.nan, dtype=float)
         out_ok_p = np.zeros(n, dtype=bool)
         out_ok_m = np.zeros(n, dtype=bool)
         out_dir_p = np.full((n, 3), np.nan, dtype=float)
@@ -461,32 +556,23 @@ class PrecomputedEarliestInterpolator:
             gbm_chunk, _ = self._masked_trilinear(gb_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
             gap_chunk, _ = self._masked_trilinear(ga_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
             gam_chunk, _ = self._masked_trilinear(ga_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dbp_chunk, _ = self._masked_trilinear_vec2(db_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dbm_chunk, _ = self._masked_trilinear_vec2(db_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dap_chunk, _ = self._masked_trilinear_vec2(da_p, ok_p, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
+            dam_chunk, _ = self._masked_trilinear_vec2(da_m, ok_m, ib0, ib1, wb, ir0, ir1, wr, ip0, ip1, wp, xp=xp)
 
-            # Branch orientation sign in local 2D frame.
-            # short branch (+1) follows signed shortest angular change A->B; long is opposite.
-            dtheta_short = xp.mod(-a_phi + pi, 2.0 * pi) - pi
-            short_sign = xp.where(dtheta_short >= 0.0, 1.0, -1.0)
-            orient_plus = short_sign
-            orient_minus = -short_sign
-
-            # Arrival radial sign at B (A inside => outward arrival; A outside => inward arrival).
-            r_a3 = xp.sqrt(xp.sum(aa * aa, axis=1))
-            radial_sign = xp.where(r_a3 <= r_b, 1.0, -1.0)
-
-            def _build_arrival_dir(gamma_chunk, ok_chunk, orient_sign):
+            def _rotate_local_dir(local_chunk, ok_chunk):
                 d = xp.full((m, 3), xp.nan, dtype=float)
-                good = ok_chunk & xp.isfinite(gamma_chunk)
+                good = ok_chunk & xp.all(xp.isfinite(local_chunk), axis=1)
                 if xp.any(good):
-                    dr = radial_sign * xp.cos(gamma_chunk)
-                    dtan = orient_sign * xp.sin(gamma_chunk)
-                    vv = dr[:, None] * er + dtan[:, None] * ephi
+                    vv = local_chunk[:, 0:1] * er + local_chunk[:, 1:2] * ephi
                     nv = xp.sqrt(xp.sum(vv * vv, axis=1))
                     vv = vv / xp.maximum(nv[:, None], eps)
                     d[good] = vv[good]
                 return d
 
-            dir_p = _build_arrival_dir(gbp_chunk, okp_chunk, orient_plus)
-            dir_m = _build_arrival_dir(gbm_chunk, okm_chunk, orient_minus)
+            dir_p = _rotate_local_dir(dbp_chunk, okp_chunk)
+            dir_m = _rotate_local_dir(dbm_chunk, okm_chunk)
 
             az_p = xp.arctan2(dir_p[:, 1], dir_p[:, 0])
             az_m = xp.arctan2(dir_m[:, 1], dir_m[:, 0])
@@ -500,6 +586,10 @@ class PrecomputedEarliestInterpolator:
                 out_gb_m[lo:hi] = gbm_chunk
                 out_ga_p[lo:hi] = gap_chunk
                 out_ga_m[lo:hi] = gam_chunk
+                out_db_p[lo:hi] = dbp_chunk
+                out_db_m[lo:hi] = dbm_chunk
+                out_da_p[lo:hi] = dap_chunk
+                out_da_m[lo:hi] = dam_chunk
                 out_ok_p[lo:hi] = okp_chunk
                 out_ok_m[lo:hi] = okm_chunk
                 out_dir_p[lo:hi] = dir_p
@@ -515,6 +605,10 @@ class PrecomputedEarliestInterpolator:
                 out_gb_m[lo:hi] = xp.asnumpy(gbm_chunk)
                 out_ga_p[lo:hi] = xp.asnumpy(gap_chunk)
                 out_ga_m[lo:hi] = xp.asnumpy(gam_chunk)
+                out_db_p[lo:hi] = xp.asnumpy(dbp_chunk)
+                out_db_m[lo:hi] = xp.asnumpy(dbm_chunk)
+                out_da_p[lo:hi] = xp.asnumpy(dap_chunk)
+                out_da_m[lo:hi] = xp.asnumpy(dam_chunk)
                 out_ok_p[lo:hi] = xp.asnumpy(okp_chunk)
                 out_ok_m[lo:hi] = xp.asnumpy(okm_chunk)
                 out_dir_p[lo:hi] = xp.asnumpy(dir_p)
@@ -539,6 +633,10 @@ class PrecomputedEarliestInterpolator:
             "gamma_at_b_minus_rad": out_gb_m,
             "gamma_at_a_plus_rad": out_ga_p,
             "gamma_at_a_minus_rad": out_ga_m,
+            "dir_at_b_plus_local_xy": out_db_p,
+            "dir_at_b_minus_local_xy": out_db_m,
+            "dir_at_a_plus_local_xy": out_da_p,
+            "dir_at_a_minus_local_xy": out_da_m,
             "ok_plus": out_ok_p,
             "ok_minus": out_ok_m,
             "ok_both": ok_both,
@@ -596,6 +694,232 @@ def _arrival_gamma_at_b(rs: float, r_b: float, impact_parameter_m: float) -> flo
 def _local_gamma_at_radius(rs: float, r: float, impact_parameter_m: float) -> float:
     s = impact_parameter_m * sqrt(1.0 - rs / r) / r
     return asin(_clamp(s, -1.0, 1.0))
+
+
+def _unit_xy(vec_xy: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(vec_xy))
+    if n <= 0.0:
+        return np.asarray([1.0, 0.0], dtype=float)
+    return vec_xy / n
+
+
+def _direction_from_angle_at_a_for_pair(a_point: np.ndarray, b_point: np.ndarray, gamma_at_a: float, branch_side: int) -> np.ndarray:
+    er = _unit_xy(a_point[:2])
+    ephi = np.asarray([-er[1], er[0]], dtype=float)
+
+    th_a = float(np.arctan2(float(a_point[1]), float(a_point[0])))
+    th_b = float(np.arctan2(float(b_point[1]), float(b_point[0])))
+    dth_short = ((th_b - th_a + pi) % (2.0 * pi)) - pi
+    short_sign = +1.0 if dth_short >= 0.0 else -1.0
+    orient_sign = short_sign if int(branch_side) == +1 else -short_sign
+
+    to_b = _unit_xy(np.asarray(b_point[:2], dtype=float) - np.asarray(a_point[:2], dtype=float))
+    d_out = _unit_xy((cos(gamma_at_a)) * er + (orient_sign * sin(gamma_at_a)) * ephi)
+    d_in = _unit_xy((-cos(gamma_at_a)) * er + (orient_sign * sin(gamma_at_a)) * ephi)
+    align_out = float(np.dot(d_out, to_b))
+    align_in = float(np.dot(d_in, to_b))
+
+    r_a = float(np.linalg.norm(a_point[:2]))
+    r_b = float(np.linalg.norm(b_point[:2]))
+    if r_a < r_b and int(branch_side) == -1:
+        return d_in if float(np.dot(d_in, er)) <= float(np.dot(d_out, er)) else d_out
+    return d_out if align_out >= align_in else d_in
+
+
+def _arrival_direction_at_b_for_pair(
+    a_point: np.ndarray,
+    b_point: np.ndarray,
+    gamma_at_b: float,
+    branch_side: int,
+    branch_name: str,
+) -> np.ndarray:
+    er = _unit_xy(b_point[:2])
+    ephi = np.asarray([-er[1], er[0]], dtype=float)
+
+    a_xy = np.asarray(a_point[:2], dtype=float)
+    x_a = float(np.dot(a_xy, er))
+    y_a = float(np.dot(a_xy, ephi))
+    a_phi = float(np.arctan2(y_a, x_a))
+    dth_short = ((-a_phi + pi) % (2.0 * pi)) - pi
+    short_sign = +1.0 if dth_short >= 0.0 else -1.0
+    orient_sign = short_sign if int(branch_side) == +1 else -short_sign
+
+    r_b = float(np.linalg.norm(b_point[:2]))
+    r_a = float(np.linalg.norm(a_point[:2]))
+    if str(branch_name) == "turning":
+        radial_sign = +1.0 if r_a > r_b else -1.0
+    else:
+        radial_sign = -1.0 if r_a > r_b else +1.0
+    d = (radial_sign * cos(gamma_at_b)) * er + (orient_sign * sin(gamma_at_b)) * ephi
+    return _unit_xy(d)
+
+
+def _dir_world_to_local(point_xy: np.ndarray, dir_xy: np.ndarray) -> np.ndarray:
+    er = _unit_xy(point_xy[:2])
+    ephi = np.asarray([-er[1], er[0]], dtype=float)
+    d = _unit_xy(dir_xy[:2])
+    return np.asarray([float(np.dot(d, er)), float(np.dot(d, ephi))], dtype=float)
+
+
+def _family_states_for_valid(valid_idx: List[int]) -> List[Tuple[int | None, int | None]]:
+    if not valid_idx:
+        return [(None, None)]
+    states: List[Tuple[int | None, int | None]] = []
+    for i in valid_idx:
+        states.append((i, None))
+        states.append((None, i))
+    for i in valid_idx:
+        for j in valid_idx:
+            if i != j:
+                states.append((i, j))
+    uniq: List[Tuple[int | None, int | None]] = []
+    seen = set()
+    for st in states:
+        if st not in seen:
+            uniq.append(st)
+            seen.add(st)
+    return uniq
+
+
+def _family_transition_cost(
+    prev_state: Tuple[int | None, int | None],
+    curr_state: Tuple[int | None, int | None],
+    prev_b: np.ndarray,
+    prev_a: np.ndarray,
+    curr_b: np.ndarray,
+    curr_a: np.ndarray,
+) -> float:
+    cost = 0.0
+    missing_penalty = 0.15
+    for fam in range(2):
+        ip = prev_state[fam]
+        ic = curr_state[fam]
+        if ip is None and ic is None:
+            continue
+        if ip is None or ic is None:
+            cost += missing_penalty
+            continue
+        dot_b = float(np.clip(np.dot(prev_b[ip], curr_b[ic]), -1.0, 1.0))
+        dot_a = float(np.clip(np.dot(prev_a[ip], curr_a[ic]), -1.0, 1.0))
+        cost += (1.0 - dot_b) + 0.35 * (1.0 - dot_a)
+    return cost
+
+
+def _relabel_ring_by_continuity(
+    cand_ok: np.ndarray,
+    cand_dt: np.ndarray,
+    cand_gamma_b: np.ndarray,
+    cand_gamma_a: np.ndarray,
+    cand_dir_b: np.ndarray,
+    cand_dir_a: np.ndarray,
+    cand_impact: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    n_phi = int(cand_ok.shape[0])
+    states_by_phi = [_family_states_for_valid(np.where(cand_ok[ip])[0].tolist()) for ip in range(n_phi)]
+
+    best_total = None
+    best_trace: List[Tuple[int | None, int | None]] | None = None
+    start_states = states_by_phi[0]
+    for start_state in start_states:
+        dp: List[Dict[Tuple[int | None, int | None], Tuple[float, Tuple[int | None, int | None] | None]]] = []
+        dp.append({start_state: (0.0, None)})
+        for ip in range(1, n_phi):
+            prev_map = dp[-1]
+            curr_map: Dict[Tuple[int | None, int | None], Tuple[float, Tuple[int | None, int | None] | None]] = {}
+            for curr_state in states_by_phi[ip]:
+                best_cost = None
+                best_prev = None
+                for prev_state, (prev_cost, _) in prev_map.items():
+                    cc = _family_transition_cost(
+                        prev_state,
+                        curr_state,
+                        cand_dir_b[ip - 1],
+                        cand_dir_a[ip - 1],
+                        cand_dir_b[ip],
+                        cand_dir_a[ip],
+                    )
+                    total = prev_cost + cc
+                    if best_cost is None or total < best_cost:
+                        best_cost = total
+                        best_prev = prev_state
+                curr_map[curr_state] = (0.0 if best_cost is None else best_cost, best_prev)
+            dp.append(curr_map)
+
+        for end_state, (end_cost, _) in dp[-1].items():
+            closure = _family_transition_cost(
+                end_state,
+                start_state,
+                cand_dir_b[-1],
+                cand_dir_a[-1],
+                cand_dir_b[0],
+                cand_dir_a[0],
+            )
+            total_cost = end_cost + closure
+            if best_total is None or total_cost < best_total:
+                trace: List[Tuple[int | None, int | None]] = [end_state]
+                for ip in range(n_phi - 1, 0, -1):
+                    prev_state = dp[ip][trace[-1]][1]
+                    if prev_state is None:
+                        break
+                    trace.append(prev_state)
+                trace.reverse()
+                if len(trace) == n_phi:
+                    best_total = total_cost
+                    best_trace = trace
+
+    if best_trace is None:
+        raise RuntimeError("Failed to continuity-label branch families on ring.")
+
+    out_ok_p = np.zeros(n_phi, dtype=bool)
+    out_ok_m = np.zeros(n_phi, dtype=bool)
+    out_dt_p = np.full(n_phi, np.nan, dtype=float)
+    out_dt_m = np.full(n_phi, np.nan, dtype=float)
+    out_gb_p = np.full(n_phi, np.nan, dtype=float)
+    out_gb_m = np.full(n_phi, np.nan, dtype=float)
+    out_ga_p = np.full(n_phi, np.nan, dtype=float)
+    out_ga_m = np.full(n_phi, np.nan, dtype=float)
+    out_db_p = np.full((n_phi, 2), np.nan, dtype=float)
+    out_db_m = np.full((n_phi, 2), np.nan, dtype=float)
+    out_da_p = np.full((n_phi, 2), np.nan, dtype=float)
+    out_da_m = np.full((n_phi, 2), np.nan, dtype=float)
+    out_imp_p = np.full(n_phi, np.nan, dtype=float)
+    out_imp_m = np.full(n_phi, np.nan, dtype=float)
+
+    for ip, state in enumerate(best_trace):
+        i_plus, i_minus = state
+        if i_plus is not None and cand_ok[ip, i_plus]:
+            out_ok_p[ip] = True
+            out_dt_p[ip] = cand_dt[ip, i_plus]
+            out_gb_p[ip] = cand_gamma_b[ip, i_plus]
+            out_ga_p[ip] = cand_gamma_a[ip, i_plus]
+            out_db_p[ip, :] = cand_dir_b[ip, i_plus, :]
+            out_da_p[ip, :] = cand_dir_a[ip, i_plus, :]
+            out_imp_p[ip] = cand_impact[ip, i_plus]
+        if i_minus is not None and cand_ok[ip, i_minus]:
+            out_ok_m[ip] = True
+            out_dt_m[ip] = cand_dt[ip, i_minus]
+            out_gb_m[ip] = cand_gamma_b[ip, i_minus]
+            out_ga_m[ip] = cand_gamma_a[ip, i_minus]
+            out_db_m[ip, :] = cand_dir_b[ip, i_minus, :]
+            out_da_m[ip, :] = cand_dir_a[ip, i_minus, :]
+            out_imp_m[ip] = cand_impact[ip, i_minus]
+
+    return {
+        "ok_plus": out_ok_p,
+        "ok_minus": out_ok_m,
+        "delta_t_plus_s": out_dt_p,
+        "delta_t_minus_s": out_dt_m,
+        "gamma_at_b_plus_rad": out_gb_p,
+        "gamma_at_b_minus_rad": out_gb_m,
+        "gamma_at_a_plus_rad": out_ga_p,
+        "gamma_at_a_minus_rad": out_ga_m,
+        "dir_at_b_plus_local_xy": out_db_p,
+        "dir_at_b_minus_local_xy": out_db_m,
+        "dir_at_a_plus_local_xy": out_da_p,
+        "dir_at_a_minus_local_xy": out_da_m,
+        "impact_parameter_plus_m": out_imp_p,
+        "impact_parameter_minus_m": out_imp_m,
+    }
 
 
 def _density_factor_from_error(max_interp_error_rel: float) -> float:
@@ -670,6 +994,35 @@ def _solve_pairs_robust(
         subset = pairs[lo:hi]
         try:
             rr = bh.find_two_shortest_geodesics_batch(subset, a_before_b=True, use_gpu=use_gpu)
+            if len(rr) != (hi - lo):
+                raise RuntimeError("Unexpected batch result length mismatch.")
+            for i, result in enumerate(rr):
+                out[lo + i] = result
+            return
+        except Exception:
+            if hi - lo == 1:
+                out[lo] = None
+                return
+            mid = lo + (hi - lo) // 2
+            solve_span(lo, mid)
+            solve_span(mid, hi)
+
+    solve_span(0, n)
+    return out
+
+
+def _solve_pairs_all_robust(
+    bh: SchwarzschildBlackHole,
+    pairs: Sequence[Tuple[Sequence[float], Sequence[float]]],
+    use_gpu: bool,
+):
+    n = len(pairs)
+    out = [None] * n
+
+    def solve_span(lo: int, hi: int) -> None:
+        subset = pairs[lo:hi]
+        try:
+            rr = bh.find_all_geodesic_candidates_batch(subset, a_before_b=True, use_gpu=use_gpu)
             if len(rr) != (hi - lo):
                 raise RuntimeError("Unexpected batch result length mismatch.")
             for i, result in enumerate(rr):
@@ -807,13 +1160,6 @@ def _build_path_profile(
         phi_samples = [target_phi * i / max(1, len(phi_samples) - 1) for i in range(len(phi_samples))]
 
     return r_samples, phi_samples
-
-
-def _unit_xy(vec_xy: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(vec_xy))
-    if n <= 0.0:
-        return np.asarray([1.0, 0.0], dtype=float)
-    return vec_xy / n
 
 
 def _direction_from_angle_at_a(a_point: np.ndarray, gamma_at_a: float, side: int) -> np.ndarray:
@@ -1178,12 +1524,25 @@ def main() -> None:
         )
     print(f"Total pairs: {n_pairs}")
 
+    max_candidates = 4
+    cand_ok = np.zeros((n_b, n_a, max_candidates), dtype=bool)
+    cand_dt = np.full((n_b, n_a, max_candidates), np.nan, dtype=float)
+    cand_gamma_b = np.full((n_b, n_a, max_candidates), np.nan, dtype=float)
+    cand_gamma_a = np.full((n_b, n_a, max_candidates), np.nan, dtype=float)
+    cand_dir_b = np.full((n_b, n_a, max_candidates, 2), np.nan, dtype=float)
+    cand_dir_a = np.full((n_b, n_a, max_candidates, 2), np.nan, dtype=float)
+    cand_impact = np.full((n_b, n_a, max_candidates), np.nan, dtype=float)
+
     dt_plus = np.full((n_b, n_a), np.nan, dtype=float)
     dt_minus = np.full((n_b, n_a), np.nan, dtype=float)
     gamma_plus = np.full((n_b, n_a), np.nan, dtype=float)
     gamma_minus = np.full((n_b, n_a), np.nan, dtype=float)
     gamma_a_plus = np.full((n_b, n_a), np.nan, dtype=float)
     gamma_a_minus = np.full((n_b, n_a), np.nan, dtype=float)
+    dir_b_plus = np.full((n_b, n_a, 2), np.nan, dtype=float)
+    dir_b_minus = np.full((n_b, n_a, 2), np.nan, dtype=float)
+    dir_a_plus = np.full((n_b, n_a, 2), np.nan, dtype=float)
+    dir_a_minus = np.full((n_b, n_a, 2), np.nan, dtype=float)
     impact_plus = np.full((n_b, n_a), np.nan, dtype=float)
     impact_minus = np.full((n_b, n_a), np.nan, dtype=float)
     ok_plus = np.zeros((n_b, n_a), dtype=bool)
@@ -1206,7 +1565,7 @@ def main() -> None:
             pairs.append((a_points[a_i], b_points[b_i]))
             flat_indices.append(flat_i)
 
-        results = _solve_pairs_robust(bh=bh, pairs=pairs, use_gpu=args.use_gpu)
+        results = _solve_pairs_all_robust(bh=bh, pairs=pairs, use_gpu=args.use_gpu)
 
         for flat_i, result in zip(flat_indices, results):
             b_i = flat_i // n_a
@@ -1216,22 +1575,29 @@ def main() -> None:
             if result is None:
                 failed_pairs += 1
                 continue
-
-            p_plus = _get_path_by_direction(result.paths, +1)
-            if p_plus is not None:
-                ok_plus[b_i, a_i] = True
-                dt_plus[b_i, a_i] = float(p_plus.travel_time_s)
-                impact_plus[b_i, a_i] = float(p_plus.impact_parameter_m)
-                gamma_plus[b_i, a_i] = _local_gamma_at_radius(rs, r_b, float(p_plus.impact_parameter_m))
-                gamma_a_plus[b_i, a_i] = _local_gamma_at_radius(rs, r_a, float(p_plus.impact_parameter_m))
-
-            p_minus = _get_path_by_direction(result.paths, -1)
-            if p_minus is not None:
-                ok_minus[b_i, a_i] = True
-                dt_minus[b_i, a_i] = float(p_minus.travel_time_s)
-                impact_minus[b_i, a_i] = float(p_minus.impact_parameter_m)
-                gamma_minus[b_i, a_i] = _local_gamma_at_radius(rs, r_b, float(p_minus.impact_parameter_m))
-                gamma_a_minus[b_i, a_i] = _local_gamma_at_radius(rs, r_a, float(p_minus.impact_parameter_m))
+            for cand_i, path in enumerate(result.paths[:max_candidates]):
+                gamma_b = _local_gamma_at_radius(rs, r_b, float(path.impact_parameter_m))
+                gamma_a = _local_gamma_at_radius(rs, r_a, float(path.impact_parameter_m))
+                d_a = _direction_from_angle_at_a_for_pair(
+                    np.asarray(a_points[a_i], dtype=float),
+                    np.asarray(b_points[b_i], dtype=float),
+                    float(gamma_a),
+                    branch_side=int(path.direction),
+                )
+                d_b = _arrival_direction_at_b_for_pair(
+                    np.asarray(a_points[a_i], dtype=float),
+                    np.asarray(b_points[b_i], dtype=float),
+                    float(gamma_b),
+                    branch_side=int(path.direction),
+                    branch_name=str(path.branch),
+                )
+                cand_ok[b_i, a_i, cand_i] = True
+                cand_dt[b_i, a_i, cand_i] = float(path.travel_time_s)
+                cand_gamma_b[b_i, a_i, cand_i] = float(gamma_b)
+                cand_gamma_a[b_i, a_i, cand_i] = float(gamma_a)
+                cand_dir_b[b_i, a_i, cand_i, :] = _dir_world_to_local(np.asarray(b_points[b_i], dtype=float), d_b)
+                cand_dir_a[b_i, a_i, cand_i, :] = _dir_world_to_local(np.asarray(a_points[a_i], dtype=float), d_a)
+                cand_impact[b_i, a_i, cand_i] = float(path.impact_parameter_m)
 
         done = stop
         pct = 100.0 * done / n_pairs
@@ -1248,6 +1614,36 @@ def main() -> None:
         frac = failed_pairs / max(1, n_pairs)
         if frac > 0.25:
             print("Warning: high unsolved fraction. Consider increasing --rmin-rs (e.g., 4.8).")
+
+    n_phi = int(a_phi.size)
+    if n_phi > 0:
+        for b_i in range(n_b):
+            for r_i in range(a_r.size):
+                lo = int(r_i * n_phi)
+                hi = int((r_i + 1) * n_phi)
+                relabeled = _relabel_ring_by_continuity(
+                    cand_ok=cand_ok[b_i, lo:hi, :],
+                    cand_dt=cand_dt[b_i, lo:hi, :],
+                    cand_gamma_b=cand_gamma_b[b_i, lo:hi, :],
+                    cand_gamma_a=cand_gamma_a[b_i, lo:hi, :],
+                    cand_dir_b=cand_dir_b[b_i, lo:hi, :, :],
+                    cand_dir_a=cand_dir_a[b_i, lo:hi, :, :],
+                    cand_impact=cand_impact[b_i, lo:hi, :],
+                )
+                ok_plus[b_i, lo:hi] = relabeled["ok_plus"]
+                ok_minus[b_i, lo:hi] = relabeled["ok_minus"]
+                dt_plus[b_i, lo:hi] = relabeled["delta_t_plus_s"]
+                dt_minus[b_i, lo:hi] = relabeled["delta_t_minus_s"]
+                gamma_plus[b_i, lo:hi] = relabeled["gamma_at_b_plus_rad"]
+                gamma_minus[b_i, lo:hi] = relabeled["gamma_at_b_minus_rad"]
+                gamma_a_plus[b_i, lo:hi] = relabeled["gamma_at_a_plus_rad"]
+                gamma_a_minus[b_i, lo:hi] = relabeled["gamma_at_a_minus_rad"]
+                dir_b_plus[b_i, lo:hi, :] = relabeled["dir_at_b_plus_local_xy"]
+                dir_b_minus[b_i, lo:hi, :] = relabeled["dir_at_b_minus_local_xy"]
+                dir_a_plus[b_i, lo:hi, :] = relabeled["dir_at_a_plus_local_xy"]
+                dir_a_minus[b_i, lo:hi, :] = relabeled["dir_at_a_minus_local_xy"]
+                impact_plus[b_i, lo:hi] = relabeled["impact_parameter_plus_m"]
+                impact_minus[b_i, lo:hi] = relabeled["impact_parameter_minus_m"]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1272,6 +1668,10 @@ def main() -> None:
         "gamma_at_b_minus_rad": gamma_minus,
         "gamma_at_a_plus_rad": gamma_a_plus,
         "gamma_at_a_minus_rad": gamma_a_minus,
+        "dir_at_b_plus_local_xy": dir_b_plus,
+        "dir_at_b_minus_local_xy": dir_b_minus,
+        "dir_at_a_plus_local_xy": dir_a_plus,
+        "dir_at_a_minus_local_xy": dir_a_minus,
         "impact_parameter_plus_m": impact_plus,
         "impact_parameter_minus_m": impact_minus,
         "ok_plus": ok_plus,
