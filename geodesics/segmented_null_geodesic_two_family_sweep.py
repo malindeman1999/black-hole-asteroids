@@ -53,15 +53,17 @@ def _polar_to_xy(r: np.ndarray, th: np.ndarray) -> np.ndarray:
     return np.stack([rr * np.cos(tt), rr * np.sin(tt)], axis=1)
 
 
-def _segment_metric_terms(
-    rs_m: float,
-    r_nodes: np.ndarray,
+def _segment_metric_terms_rs(
+    r_nodes_rs: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    r0 = np.asarray(r_nodes[:-1], dtype=float)
-    r1 = np.asarray(r_nodes[1:], dtype=float)
+    """
+    Segment metric terms in normalized units where Rs=1.
+    """
+    r0 = np.asarray(r_nodes_rs[:-1], dtype=float)
+    r1 = np.asarray(r_nodes_rs[1:], dtype=float)
     rm = 0.5 * (r0 + r1)
-    g = 1.0 - float(rs_m) / rm
-    if np.any(~np.isfinite(rm)) or np.any(rm <= float(rs_m)) or np.any(g <= 0.0):
+    g = 1.0 - 1.0 / rm
+    if np.any(~np.isfinite(rm)) or np.any(rm <= 1.0) or np.any(g <= 0.0):
         return None
     dr = r1 - r0
     a_term = (dr * dr) / (g * g)
@@ -69,15 +71,15 @@ def _segment_metric_terms(
     return rm, g, dr, a_term, b_term
 
 
-def _travel_time_only_s_from_dtheta(dtheta: np.ndarray, a_term: np.ndarray, b_term: np.ndarray) -> float:
+def _travel_time_only_rs_from_dtheta(dtheta: np.ndarray, a_term: np.ndarray, b_term: np.ndarray) -> float:
     arg = a_term + b_term * (dtheta * dtheta)
     if np.any(~np.isfinite(arg)) or np.any(arg < 0.0):
         return float("inf")
-    return float(np.sum(np.sqrt(arg), dtype=float) / C)
+    return float(np.sum(np.sqrt(arg), dtype=float))
 
 
-def _travel_time_and_proper_time_s(rs_m: float, r_nodes: np.ndarray, theta_nodes: np.ndarray) -> Tuple[float, float]:
-    seg = _segment_metric_terms(rs_m=rs_m, r_nodes=r_nodes)
+def _travel_time_and_proper_time_rs(r_nodes_rs: np.ndarray, theta_nodes: np.ndarray) -> Tuple[float, float]:
+    seg = _segment_metric_terms_rs(r_nodes_rs=r_nodes_rs)
     if seg is None:
         return float("inf"), float("inf")
     rm, g, dr, a_term, b_term = seg
@@ -86,17 +88,17 @@ def _travel_time_and_proper_time_s(rs_m: float, r_nodes: np.ndarray, theta_nodes
     if np.any(~np.isfinite(arg)) or np.any(arg < 0.0):
         return float("inf"), float("inf")
     sqrt_arg = np.sqrt(arg)
-    dt_seg = sqrt_arg / C
+    dt_seg = sqrt_arg
     t_total = float(np.sum(dt_seg, dtype=float))
-    ds2 = -(g * C * C * dt_seg * dt_seg) + (dr * dr) / g + (rm * rm * dtheta * dtheta)
+    ds2 = -(g * dt_seg * dt_seg) + (dr * dr) / g + (rm * rm * dtheta * dtheta)
     if np.any(~np.isfinite(ds2)):
         return float("inf"), float("inf")
-    tau_seg = np.where(ds2 < 0.0, np.sqrt(np.maximum(-ds2, 0.0)) / C, 0.0)
+    tau_seg = np.where(ds2 < 0.0, np.sqrt(np.maximum(-ds2, 0.0)), 0.0)
     tau_total = float(np.sum(tau_seg, dtype=float))
     return t_total, tau_total
 
 
-def _path_min_radius_m(xy: np.ndarray) -> float:
+def _path_min_radius(xy: np.ndarray) -> float:
     """
     Minimum radius from origin attained along a piecewise-linear XY path.
     Checks both nodes and segment interiors.
@@ -187,7 +189,7 @@ def _build_path_r_nodes(a_radius_m: float, b_radius_m: float, n: int, spacing: s
 
 def _optimize_thetas(
     rs_m: float,
-    r_nodes: np.ndarray,
+    r_nodes_rs: np.ndarray,
     theta_a: float,
     theta_b: float,
     theta0_interior: np.ndarray,
@@ -197,21 +199,30 @@ def _optimize_thetas(
     opt_gtol: float,
 ) -> Tuple[np.ndarray, float, float, bool, int, str]:
     n_int = int(len(theta0_interior))
-    seg = _segment_metric_terms(rs_m=rs_m, r_nodes=r_nodes)
+    seg = _segment_metric_terms_rs(r_nodes_rs=r_nodes_rs)
     if seg is None:
         return np.asarray(theta0_interior, dtype=float), float("inf"), float("inf"), False, 0, "invalid segment geometry"
     _rm, _g, _dr, a_term, b_term = seg
+    sec_per_rs = max(float(rs_m) / C, 1e-30)
 
     if n_int <= 0:
         theta = _build_theta(theta_a, theta_b, np.zeros(0, dtype=float))
-        t, tau = _travel_time_and_proper_time_s(rs_m, r_nodes, theta)
-        return np.zeros(0, dtype=float), float(t), float(tau), np.isfinite(t), 0, "no interior nodes"
+        t_rs, tau_rs = _travel_time_and_proper_time_rs(r_nodes_rs, theta)
+        return (
+            np.zeros(0, dtype=float),
+            float(t_rs * sec_per_rs),
+            float(tau_rs * sec_per_rs),
+            np.isfinite(t_rs),
+            0,
+            "no interior nodes",
+        )
 
     theta0 = np.asarray(theta0_interior, dtype=float).copy()
     # Make objective numerically scale-invariant to BH size.
     # t scales ~ linearly with rs_m when geometry is fixed in Rs units.
-    t_scale_s = max(float(rs_m) / C, 1e-30)
+    t_scale_s = sec_per_rs
     smooth_weight_s = 1e-12
+    smooth_weight_rs = smooth_weight_s / t_scale_s
 
     theta_full = np.empty(n_int + 2, dtype=float)
     grad_theta = np.empty_like(theta_full)
@@ -225,11 +236,11 @@ def _optimize_thetas(
     def objective(x: np.ndarray) -> float:
         th = _fill_theta(x)
         dtheta = th[1:] - th[:-1]
-        t = _travel_time_only_s_from_dtheta(dtheta=dtheta, a_term=a_term, b_term=b_term)
+        t = _travel_time_only_rs_from_dtheta(dtheta=dtheta, a_term=a_term, b_term=b_term)
         if not np.isfinite(t):
             return 1e40
         d2 = th[2:] - 2.0 * th[1:-1] + th[:-2]
-        return float((t + smooth_weight_s * np.dot(d2, d2)) / t_scale_s)
+        return float(t + smooth_weight_rs * np.dot(d2, d2))
 
     def objective_grad(x: np.ndarray) -> np.ndarray:
         th = _fill_theta(x)
@@ -238,15 +249,15 @@ def _optimize_thetas(
         if np.any(~np.isfinite(arg)) or np.any(arg <= 0.0):
             return np.zeros(n_int, dtype=float)
         sqrt_arg = np.sqrt(arg)
-        v = (b_term * dtheta) / (C * sqrt_arg)
+        v = (b_term * dtheta) / sqrt_arg
         grad_theta.fill(0.0)
         grad_theta[:-1] -= v
         grad_theta[1:] += v
         d2 = th[2:] - 2.0 * th[1:-1] + th[:-2]
-        grad_theta[:-2] += 2.0 * smooth_weight_s * d2
-        grad_theta[1:-1] -= 4.0 * smooth_weight_s * d2
-        grad_theta[2:] += 2.0 * smooth_weight_s * d2
-        return np.asarray(grad_theta[1:-1] / t_scale_s, dtype=float)
+        grad_theta[:-2] += 2.0 * smooth_weight_rs * d2
+        grad_theta[1:-1] -= 4.0 * smooth_weight_rs * d2
+        grad_theta[2:] += 2.0 * smooth_weight_rs * d2
+        return np.asarray(grad_theta[1:-1], dtype=float)
 
     if optimizer == "scipy" and minimize is not None:
         lo = min(theta_a, theta_b) - 4.0 * pi
@@ -255,8 +266,15 @@ def _optimize_thetas(
         g0 = objective_grad(theta0)
         if np.all(np.isfinite(g0)) and float(np.max(np.abs(g0))) < 5e-7:
             th0 = _build_theta(theta_a, theta_b, theta0)
-            t0, tau0 = _travel_time_and_proper_time_s(rs_m, r_nodes, th0)
-            return theta0, float(t0), float(tau0), np.isfinite(t0), 0, "warm-start accepted"
+            t0_rs, tau0_rs = _travel_time_and_proper_time_rs(r_nodes_rs, th0)
+            return (
+                theta0,
+                float(t0_rs * sec_per_rs),
+                float(tau0_rs * sec_per_rs),
+                np.isfinite(t0_rs),
+                0,
+                "warm-start accepted",
+            )
         res = minimize(
             objective,
             theta0,
@@ -267,8 +285,10 @@ def _optimize_thetas(
         )
         x = np.asarray(res.x, dtype=float)
         th = _build_theta(theta_a, theta_b, x)
-        t, tau = _travel_time_and_proper_time_s(rs_m, r_nodes, th)
-        return x, float(t), float(tau), bool(res.success) and np.isfinite(t), int(getattr(res, "nit", 0)), str(res.message)
+        t_rs, tau_rs = _travel_time_and_proper_time_rs(r_nodes_rs, th)
+        t_s = float(t_rs * sec_per_rs)
+        tau_s = float(tau_rs * sec_per_rs)
+        return x, t_s, tau_s, bool(res.success) and np.isfinite(t_rs), int(getattr(res, "nit", 0)), str(res.message)
 
     # Fallback: coordinate descent.
     x = theta0.copy()
@@ -297,8 +317,8 @@ def _optimize_thetas(
             if step < 1e-6:
                 break
     th = _build_theta(theta_a, theta_b, x)
-    t, tau = _travel_time_and_proper_time_s(rs_m, r_nodes, th)
-    return x, float(t), float(tau), np.isfinite(t), int(n_it), "coordinate-descent"
+    t_rs, tau_rs = _travel_time_and_proper_time_rs(r_nodes_rs, th)
+    return x, float(t_rs * sec_per_rs), float(tau_rs * sec_per_rs), np.isfinite(t_rs), int(n_it), "coordinate-descent"
 
 
 @dataclass
@@ -363,9 +383,11 @@ def solve_ring_for_b_radius(
         a_phi = step * np.arange(count, dtype=float)
     else:
         a_phi = np.linspace(0.0, 2.0 * pi, int(a_phi_count), endpoint=False, dtype=float)
-    r_nodes = _build_path_r_nodes(
-        a_radius_m=float(a_radius_m),
-        b_radius_m=float(b_radius_m),
+    a_radius_rs = float(a_radius_m) / float(rs_m)
+    b_radius_rs = float(b_radius_m) / float(rs_m)
+    r_nodes_rs = _build_path_r_nodes(
+        a_radius_m=float(a_radius_rs),
+        b_radius_m=float(b_radius_rs),
         n=int(node_count),
         spacing=str(node_spacing),
     )
@@ -384,7 +406,7 @@ def solve_ring_for_b_radius(
     photon_safe_plus = np.zeros(a_phi.size, dtype=bool)
     min_radius_plus_m = np.full(a_phi.size, np.nan, dtype=float)
     iters = np.zeros(a_phi.size, dtype=np.int32)
-    r_ph = 1.5 * float(rs_m)
+    r_ph_rs = 1.5
 
     n_int = node_count - 2
     prev_theta_nodes = _build_theta(0.0, 0.0, np.zeros(n_int, dtype=float))
@@ -408,7 +430,7 @@ def solve_ring_for_b_radius(
 
         x_opt, t_s, tau_s, ok, n_it, opt_msg = _optimize_thetas(
             rs_m=rs_m,
-            r_nodes=r_nodes,
+            r_nodes_rs=r_nodes_rs,
             theta_a=theta_a,
             theta_b=theta_b,
             theta0_interior=theta0_interior,
@@ -424,7 +446,7 @@ def solve_ring_for_b_radius(
                 retry_budget = min(max(50, 2 * retry_budget), max(50, 8 * int(max_iter)))
                 x_opt2, t_s2, tau_s2, ok2, n_it2, opt_msg2 = _optimize_thetas(
                     rs_m=rs_m,
-                    r_nodes=r_nodes,
+                    r_nodes_rs=r_nodes_rs,
                     theta_a=theta_a,
                     theta_b=theta_b,
                     theta0_interior=retry_interior,
@@ -438,20 +460,21 @@ def solve_ring_for_b_radius(
                 if bool(ok):
                     print(
                         "[retry] "
-                        f"B={b_radius_m/rs_m:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | "
+                        f"B={b_radius_rs:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | "
                         f"resolved iteration cap with max_iter={retry_budget}.",
                         flush=True,
                     )
                     break
         theta_nodes = _build_theta(theta_a, theta_b, x_opt)
-        xy = _polar_to_xy(r_nodes, theta_nodes)
+        xy_rs = _polar_to_xy(r_nodes_rs, theta_nodes)
+        xy = xy_rs * float(rs_m)
 
         path_plus[i, :, :] = xy
         t_plus[i] = t_s
         tau_plus[i] = tau_s
-        min_r = _path_min_radius_m(xy)
-        min_radius_plus_m[i] = float(min_r)
-        photon_safe = bool(np.isfinite(min_r) and (min_r >= r_ph))
+        min_r_rs = _path_min_radius(xy_rs)
+        min_radius_plus_m[i] = float(min_r_rs * float(rs_m))
+        photon_safe = bool(np.isfinite(min_r_rs) and (min_r_rs >= r_ph_rs))
         photon_safe_plus[i] = photon_safe
         ok_plus[i] = bool(ok) and photon_safe
         iters[i] = int(n_it)
@@ -481,13 +504,13 @@ def solve_ring_for_b_radius(
             elif not bool(photon_safe):
                 reason = (
                     "photon-sphere violation "
-                    f"(min_r={min_r/rs_m:.6f} Rs < 1.500000 Rs)"
+                    f"(min_r={min_r_rs:.6f} Rs < 1.500000 Rs)"
                 )
             else:
                 reason = "unknown failure"
             print(
                 "[fail-fast] "
-                f"B={b_radius_m/rs_m:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | {reason}. "
+                f"B={b_radius_rs:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | {reason}. "
                 "Stopping remaining paths in this ring.",
                 flush=True,
             )

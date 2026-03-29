@@ -94,14 +94,10 @@ class SegmentedNullGeodesicGUI:
         btn_row.grid(row=row, column=1, sticky="w", pady=(2, 8))
         self.btn_run = ttk.Button(btn_row, text="Run Sweep", command=self.run_sweep)
         self.btn_run_debug = ttk.Button(btn_row, text="Run Sweep (Debug)", command=self.run_sweep_debug)
-        self.btn_run_first_two = ttk.Button(
-            btn_row,
-            text="Run First 30 Paths",
-            command=self.run_first_thirty_paths,
-        )
         self.btn_plot_times = ttk.Button(btn_row, text="Plot Times", command=self.plot_times)
+        self.btn_plot_paths_pdf = ttk.Button(btn_row, text="Plot Paths PDF", command=self.plot_paths_pdf)
         self.btn_stop = ttk.Button(btn_row, text="Stop", command=self.stop_current)
-        for b in [self.btn_run, self.btn_run_debug, self.btn_run_first_two, self.btn_plot_times, self.btn_stop]:
+        for b in [self.btn_run, self.btn_run_debug, self.btn_plot_times, self.btn_plot_paths_pdf, self.btn_stop]:
             b.pack(side=tk.LEFT, padx=(0, 6))
         row += 1
 
@@ -141,7 +137,7 @@ class SegmentedNullGeodesicGUI:
     def _set_running(self, running: bool, status: str) -> None:
         self.status_var.set(status)
         state = tk.DISABLED if running else tk.NORMAL
-        for b in [self.btn_run, self.btn_run_debug, self.btn_run_first_two]:
+        for b in [self.btn_run, self.btn_run_debug]:
             b.configure(state=state)
         self.btn_stop.configure(state=(tk.NORMAL if running else tk.DISABLED))
 
@@ -269,33 +265,6 @@ class SegmentedNullGeodesicGUI:
         cmd.append("--debug-pause-rings")
         self._run_subprocess(cmd, "Segmented Sweep (Debug)")
 
-    def run_first_thirty_paths(self) -> None:
-        cmd = self._base_cmd()
-        if cmd is None:
-            return
-        try:
-            nominal_count = int(self.a_phi_count_var.get().strip())
-        except Exception:
-            nominal_count = 97
-        if nominal_count < 2:
-            nominal_count = 97
-        dphi = (2.0 * float(np.pi)) / float(nominal_count)
-        # Fast debug mode: solve the seed path and the next 29 continuation
-        # paths on the first B ring (b-r-min-rs), using small angular steps.
-        cmd.extend(
-            [
-                "--a-phi-count",
-                "30",
-                "--a-phi-step-rad",
-                f"{dphi:.17g}",
-                "--b-r-count",
-                "1",
-            ]
-        )
-        cmd.append("--debug-show-rings")
-        cmd.append("--debug-pause-rings")
-        self._run_subprocess(cmd, "Segmented Sweep (First 30 Paths)")
-
     def stop_current(self) -> None:
         with self.run_lock:
             if self.proc is None:
@@ -368,6 +337,94 @@ class SegmentedNullGeodesicGUI:
             plt.show()
         except Exception as exc:
             self.log_q.put(f"[Plot Times] Plot failed: {exc}\n")
+
+    def plot_paths_pdf(self) -> None:
+        npz_path = Path(self.output_npz_var.get()).expanduser()
+        if not npz_path.exists():
+            self.log_q.put(f"[Plot Paths] NPZ not found: {npz_path}\n")
+            return
+        try:
+            with np.load(npz_path) as data:
+                required = ["path_plus_xy_m", "path_minus_xy_m", "b_radii_m", "rs_m"]
+                missing = [k for k in required if k not in data]
+                if missing:
+                    self.log_q.put(
+                        "[Plot Paths] Missing key(s) in NPZ: "
+                        + ", ".join(missing)
+                        + ". Re-run sweep with updated solver.\n"
+                    )
+                    return
+                path_plus = np.asarray(data["path_plus_xy_m"], dtype=float)
+                path_minus = np.asarray(data["path_minus_xy_m"], dtype=float)
+                b_radii_m = np.asarray(data["b_radii_m"], dtype=float).reshape(-1)
+                rs_m = float(np.asarray(data["rs_m"], dtype=float).reshape(()))
+        except Exception as exc:
+            self.log_q.put(f"[Plot Paths] Failed to load NPZ: {exc}\n")
+            return
+
+        if path_plus.ndim != 4 or path_minus.ndim != 4 or path_plus.shape != path_minus.shape:
+            self.log_q.put("[Plot Paths] Unexpected path array shapes in NPZ.\n")
+            return
+
+        n_b, n_a, _n_nodes, _xy = path_plus.shape
+        pdf_path = npz_path.with_name(npz_path.stem + "_paths_panels.pdf")
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            n_rows, n_cols = 3, 4
+            per_page = n_rows * n_cols
+            n_pages = (n_b + per_page - 1) // per_page
+            panel_xlim = 1.15 * float(np.nanmax(np.abs(path_plus[..., 0])))
+            panel_ylim = 1.15 * float(np.nanmax(np.abs(path_plus[..., 1])))
+            panel_lim = max(panel_xlim, panel_ylim, 2.0 * rs_m)
+            tt = np.linspace(0.0, 2.0 * float(np.pi), 300)
+
+            with PdfPages(pdf_path) as pdf:
+                figs: list[object] = []
+                for page in range(n_pages):
+                    fig, axs = plt.subplots(n_rows, n_cols, figsize=(18, 11))
+                    axs_flat = axs.ravel()
+                    start = page * per_page
+                    end = min(start + per_page, n_b)
+                    for panel_i, bi in enumerate(range(start, end)):
+                        ax = axs_flat[panel_i]
+                        ax.plot(rs_m * np.cos(tt), rs_m * np.sin(tt), "k-", lw=0.7, alpha=0.9)
+                        ax.plot(1.5 * rs_m * np.cos(tt), 1.5 * rs_m * np.sin(tt), "k-.", lw=0.6, alpha=0.7)
+                        for ai in range(n_a):
+                            xy_p = path_plus[bi, ai]
+                            xy_m = path_minus[bi, ai]
+                            if np.all(np.isfinite(xy_p)):
+                                ax.plot(xy_p[:, 0], xy_p[:, 1], color="tab:blue", lw=0.6, alpha=0.35)
+                            if np.all(np.isfinite(xy_m)):
+                                ax.plot(xy_m[:, 0], xy_m[:, 1], color="tab:red", lw=0.6, alpha=0.25)
+                        b_rs = float(b_radii_m[bi]) / rs_m if rs_m > 0.0 else float("nan")
+                        ax.set_title(f"B[{bi}] = {b_rs:.3f} Rs", fontsize=9)
+                        ax.set_aspect("equal", adjustable="box")
+                        ax.set_xlim(-panel_lim, panel_lim)
+                        ax.set_ylim(-panel_lim, panel_lim)
+                        ax.grid(alpha=0.2, lw=0.4)
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+
+                    for panel_i in range(end - start, per_page):
+                        axs_flat[panel_i].axis("off")
+
+                    fig.suptitle(
+                        f"Segmented Path Sequences | page {page+1}/{n_pages} | panels {n_rows}x{n_cols}",
+                        fontsize=12,
+                    )
+                    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.95, wspace=0.02, hspace=0.04)
+                    pdf.savefig(fig)
+                    figs.append(fig)
+            self.log_q.put(f"[Plot Paths] Saved PDF: {pdf_path}\n")
+            self.log_q.put("[Plot Paths] Displaying pages on screen.\n")
+            plt.show()
+            for fig in figs:
+                plt.close(fig)
+        except Exception as exc:
+            self.log_q.put(f"[Plot Paths] Plot failed: {exc}\n")
 
 
 def main() -> None:
