@@ -49,6 +49,9 @@ class SegmentedNullGeodesicGUI:
         self.output_npz_var = tk.StringVar(
             value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_sweep.npz")
         )
+        self.output_near_npz_var = tk.StringVar(
+            value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_near_a_b_sweep.npz")
+        )
         self.scale_var = tk.StringVar(value="")
 
         row = 0
@@ -67,6 +70,7 @@ class SegmentedNullGeodesicGUI:
             ("Opt Ftol", self.opt_ftol_var),
             ("Opt Gtol", self.opt_gtol_var),
             ("Output NPZ", self.output_npz_var),
+            ("Output NPZ (Near A/B)", self.output_near_npz_var),
         ]:
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
             ttk.Entry(frame, textvariable=var, width=96).grid(row=row, column=1, sticky="ew", pady=2)
@@ -98,6 +102,24 @@ class SegmentedNullGeodesicGUI:
         self.btn_plot_paths_pdf = ttk.Button(btn_row, text="Plot Paths PDF", command=self.plot_paths_pdf)
         self.btn_stop = ttk.Button(btn_row, text="Stop", command=self.stop_current)
         for b in [self.btn_run, self.btn_run_debug, self.btn_plot_times, self.btn_plot_paths_pdf, self.btn_stop]:
+            b.pack(side=tk.LEFT, padx=(0, 6))
+        row += 1
+
+        near_btn_row = ttk.Frame(frame)
+        near_btn_row.grid(row=row, column=1, sticky="w", pady=(2, 8))
+        self.btn_run_near = ttk.Button(near_btn_row, text="Run Near Sweep", command=self.run_near_sweep)
+        self.btn_run_near_debug = ttk.Button(
+            near_btn_row,
+            text="Run Near Sweep (Debug)",
+            command=self.run_near_sweep_debug,
+        )
+        self.btn_plot_near_times = ttk.Button(near_btn_row, text="Plot Near Times", command=self.plot_near_times)
+        self.btn_plot_near_paths_pdf = ttk.Button(
+            near_btn_row,
+            text="Plot Near Paths PDF",
+            command=self.plot_near_paths_pdf,
+        )
+        for b in [self.btn_run_near, self.btn_run_near_debug, self.btn_plot_near_times, self.btn_plot_near_paths_pdf]:
             b.pack(side=tk.LEFT, padx=(0, 6))
         row += 1
 
@@ -137,7 +159,7 @@ class SegmentedNullGeodesicGUI:
     def _set_running(self, running: bool, status: str) -> None:
         self.status_var.set(status)
         state = tk.DISABLED if running else tk.NORMAL
-        for b in [self.btn_run, self.btn_run_debug]:
+        for b in [self.btn_run, self.btn_run_debug, self.btn_run_near, self.btn_run_near_debug]:
             b.configure(state=state)
         self.btn_stop.configure(state=(tk.NORMAL if running else tk.DISABLED))
 
@@ -264,6 +286,68 @@ class SegmentedNullGeodesicGUI:
         cmd.append("--debug-show-rings")
         cmd.append("--debug-pause-rings")
         self._run_subprocess(cmd, "Segmented Sweep (Debug)")
+
+    def _base_cmd_near(self) -> list[str] | None:
+        bh, err = self._try_build_black_hole()
+        if bh is None:
+            self.log_q.put(f"[Run Near] {err}\n")
+            return None
+
+        self.log_q.put(
+            "[Run Near] Using BH object scale: "
+            f"D={bh.diameter_light_seconds:.6g} light-seconds, "
+            f"Rs={bh.schwarzschild_radius_m:.6e} m, "
+            f"M={bh.mass_kg:.6e} kg\n"
+        )
+
+        cmd = [
+            self.python_var.get(),
+            "-u",
+            self._script("geodesics/segmented_null_geodesic_two_family_near_a_b_sweep.py"),
+            "--rs-m",
+            f"{bh.schwarzschild_radius_m:.17g}",
+            "--b-r-min-rs",
+            self.b_r_min_rs_var.get(),
+            "--b-r-max-rs",
+            self.b_r_max_rs_var.get(),
+            "--b-r-count",
+            self.b_r_count_var.get(),
+            "--b-spacing",
+            self.b_spacing_var.get(),
+            "--a-phi-count",
+            self.a_phi_count_var.get(),
+            "--node-count",
+            self.node_count_var.get(),
+            "--node-spacing",
+            self.node_spacing_var.get(),
+            "--optimizer",
+            self.optimizer_var.get(),
+            "--max-iter",
+            self.max_iter_var.get(),
+            "--opt-ftol",
+            self.opt_ftol_var.get(),
+            "--opt-gtol",
+            self.opt_gtol_var.get(),
+            "--output",
+            self.output_near_npz_var.get(),
+        ]
+        return cmd
+
+    def run_near_sweep(self) -> None:
+        cmd = self._base_cmd_near()
+        if cmd is None:
+            return
+        cmd.append("--no-debug-show-rings")
+        cmd.append("--no-debug-pause-rings")
+        self._run_subprocess(cmd, "Segmented Near A/B Sweep")
+
+    def run_near_sweep_debug(self) -> None:
+        cmd = self._base_cmd_near()
+        if cmd is None:
+            return
+        cmd.append("--debug-show-rings")
+        cmd.append("--debug-pause-rings")
+        self._run_subprocess(cmd, "Segmented Near A/B Sweep (Debug)")
 
     def stop_current(self) -> None:
         with self.run_lock:
@@ -425,6 +509,148 @@ class SegmentedNullGeodesicGUI:
                 plt.close(fig)
         except Exception as exc:
             self.log_q.put(f"[Plot Paths] Plot failed: {exc}\n")
+
+    def plot_near_times(self) -> None:
+        npz_path = Path(self.output_near_npz_var.get()).expanduser()
+        if not npz_path.exists():
+            self.log_q.put(f"[Plot Near Times] NPZ not found: {npz_path}\n")
+            return
+        try:
+            with np.load(npz_path) as data:
+                required = ["time_plus_s", "time_minus_s", "proper_time_plus_s", "proper_time_minus_s"]
+                missing = [k for k in required if k not in data]
+                if missing:
+                    self.log_q.put(
+                        "[Plot Near Times] Missing key(s) in NPZ: "
+                        + ", ".join(missing)
+                        + ". Re-run near sweep with updated solver.\n"
+                    )
+                    return
+                t_plus = np.asarray(data["time_plus_s"], dtype=float).reshape(-1)
+                t_minus = np.asarray(data["time_minus_s"], dtype=float).reshape(-1)
+                tau_plus = np.asarray(data["proper_time_plus_s"], dtype=float).reshape(-1)
+                tau_minus = np.asarray(data["proper_time_minus_s"], dtype=float).reshape(-1)
+        except Exception as exc:
+            self.log_q.put(f"[Plot Near Times] Failed to load NPZ: {exc}\n")
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+
+            n = int(max(t_plus.size, t_minus.size))
+            idx = np.arange(n, dtype=int)
+            fig, ax = plt.subplots(1, 1, figsize=(11, 5.2))
+            if t_plus.size:
+                ax.plot(idx[: t_plus.size], t_plus, color="tab:blue", lw=1.2, label="coordinate time (+)")
+            if t_minus.size:
+                ax.plot(idx[: t_minus.size], t_minus, color="tab:orange", lw=1.2, label="coordinate time (-)")
+            if tau_plus.size:
+                ax.plot(idx[: tau_plus.size], tau_plus, color="tab:green", lw=1.2, label="proper time (+)")
+            if tau_minus.size:
+                ax.plot(idx[: tau_minus.size], tau_minus, color="tab:red", lw=1.2, label="proper time (-)")
+            ax.set_xlabel("Path number (flattened index)")
+            ax.set_ylabel("Time (s)")
+            ax.set_title("Near A/B Coordinate and Proper Time vs Path Number")
+            ax.grid(alpha=0.25)
+            ax.legend(loc="best")
+            fig.tight_layout()
+            self.log_q.put(f"[Plot Near Times] Showing time plot from {npz_path}\n")
+            plt.show()
+        except Exception as exc:
+            self.log_q.put(f"[Plot Near Times] Plot failed: {exc}\n")
+
+    def plot_near_paths_pdf(self) -> None:
+        npz_path = Path(self.output_near_npz_var.get()).expanduser()
+        if not npz_path.exists():
+            self.log_q.put(f"[Plot Near Paths] NPZ not found: {npz_path}\n")
+            return
+        try:
+            with np.load(npz_path) as data:
+                required = ["path_plus_xy_m", "path_minus_xy_m", "a_radii_m", "b_radii_m", "rs_m"]
+                missing = [k for k in required if k not in data]
+                if missing:
+                    self.log_q.put(
+                        "[Plot Near Paths] Missing key(s) in NPZ: "
+                        + ", ".join(missing)
+                        + ". Re-run near sweep with updated solver.\n"
+                    )
+                    return
+                path_plus = np.asarray(data["path_plus_xy_m"], dtype=float)
+                path_minus = np.asarray(data["path_minus_xy_m"], dtype=float)
+                a_radii_m = np.asarray(data["a_radii_m"], dtype=float).reshape(-1)
+                b_radii_m = np.asarray(data["b_radii_m"], dtype=float).reshape(-1)
+                rs_m = float(np.asarray(data["rs_m"], dtype=float).reshape(()))
+        except Exception as exc:
+            self.log_q.put(f"[Plot Near Paths] Failed to load NPZ: {exc}\n")
+            return
+
+        if path_plus.ndim != 5 or path_minus.ndim != 5 or path_plus.shape != path_minus.shape:
+            self.log_q.put("[Plot Near Paths] Unexpected path array shapes in NPZ.\n")
+            return
+
+        n_ar, n_b, n_a, _n_nodes, _xy = path_plus.shape
+        pdf_path = npz_path.with_name(npz_path.stem + "_paths_panels.pdf")
+
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            n_rows, n_cols = 3, 4
+            per_page = n_rows * n_cols
+            panel_xlim = 1.15 * float(np.nanmax(np.abs(path_plus[..., 0])))
+            panel_ylim = 1.15 * float(np.nanmax(np.abs(path_plus[..., 1])))
+            panel_lim = max(panel_xlim, panel_ylim, 2.0 * rs_m)
+            tt = np.linspace(0.0, 2.0 * float(np.pi), 300)
+            figs: list[object] = []
+
+            with PdfPages(pdf_path) as pdf:
+                for ai in range(n_ar):
+                    n_pages = (n_b + per_page - 1) // per_page
+                    a_rs = float(a_radii_m[ai]) / rs_m if rs_m > 0.0 else float("nan")
+                    for page in range(n_pages):
+                        fig, axs = plt.subplots(n_rows, n_cols, figsize=(18, 11))
+                        axs_flat = axs.ravel()
+                        start = page * per_page
+                        end = min(start + per_page, n_b)
+                        for panel_i, bi in enumerate(range(start, end)):
+                            ax = axs_flat[panel_i]
+                            ax.plot(rs_m * np.cos(tt), rs_m * np.sin(tt), "k-", lw=0.7, alpha=0.9)
+                            ax.plot(1.5 * rs_m * np.cos(tt), 1.5 * rs_m * np.sin(tt), "k-.", lw=0.6, alpha=0.7)
+                            ax.plot(a_radii_m[ai] * np.cos(tt), a_radii_m[ai] * np.sin(tt), "k--", lw=0.6, alpha=0.5)
+                            for phi_i in range(n_a):
+                                xy_p = path_plus[ai, bi, phi_i]
+                                xy_m = path_minus[ai, bi, phi_i]
+                                if np.all(np.isfinite(xy_p)):
+                                    ax.plot(xy_p[:, 0], xy_p[:, 1], color="tab:blue", lw=0.6, alpha=0.35)
+                                if np.all(np.isfinite(xy_m)):
+                                    ax.plot(xy_m[:, 0], xy_m[:, 1], color="tab:red", lw=0.6, alpha=0.25)
+                            b_rs = float(b_radii_m[bi]) / rs_m if rs_m > 0.0 else float("nan")
+                            ax.set_title(f"A[{ai}]={a_rs:.3f} Rs | B[{bi}]={b_rs:.3f} Rs", fontsize=9)
+                            ax.set_aspect("equal", adjustable="box")
+                            ax.set_xlim(-panel_lim, panel_lim)
+                            ax.set_ylim(-panel_lim, panel_lim)
+                            ax.grid(alpha=0.2, lw=0.4)
+                            ax.set_xticks([])
+                            ax.set_yticks([])
+
+                        for panel_i in range(end - start, per_page):
+                            axs_flat[panel_i].axis("off")
+
+                        fig.suptitle(
+                            "Segmented Near A/B Path Sequences | "
+                            f"A[{ai}]={a_rs:.3f} Rs | page {page+1}/{n_pages} | panels {n_rows}x{n_cols}",
+                            fontsize=12,
+                        )
+                        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.95, wspace=0.02, hspace=0.04)
+                        pdf.savefig(fig)
+                        figs.append(fig)
+            self.log_q.put(f"[Plot Near Paths] Saved PDF: {pdf_path}\n")
+            self.log_q.put("[Plot Near Paths] Displaying pages on screen.\n")
+            plt.show()
+            for fig in figs:
+                plt.close(fig)
+        except Exception as exc:
+            self.log_q.put(f"[Plot Near Paths] Plot failed: {exc}\n")
 
 
 def main() -> None:
