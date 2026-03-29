@@ -41,9 +41,11 @@ class SegmentedNullGeodesicGUI:
         self.b_spacing_var = tk.StringVar(value="r3")
         self.a_phi_count_var = tk.StringVar(value="97")
         self.node_count_var = tk.StringVar(value="20")
-        self.node_spacing_var = tk.StringVar(value="log")
+        self.node_spacing_var = tk.StringVar(value="r3")
         self.optimizer_var = tk.StringVar(value="scipy")
         self.max_iter_var = tk.StringVar(value="250")
+        self.opt_ftol_var = tk.StringVar(value="1e-9")
+        self.opt_gtol_var = tk.StringVar(value="1e-6")
         self.output_npz_var = tk.StringVar(
             value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_sweep.npz")
         )
@@ -62,6 +64,8 @@ class SegmentedNullGeodesicGUI:
             ("Node Count", self.node_count_var),
             ("Optimizer (scipy|coord)", self.optimizer_var),
             ("Max Iter", self.max_iter_var),
+            ("Opt Ftol", self.opt_ftol_var),
+            ("Opt Gtol", self.opt_gtol_var),
             ("Output NPZ", self.output_npz_var),
         ]:
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
@@ -240,6 +244,10 @@ class SegmentedNullGeodesicGUI:
             self.optimizer_var.get(),
             "--max-iter",
             self.max_iter_var.get(),
+            "--opt-ftol",
+            self.opt_ftol_var.get(),
+            "--opt-gtol",
+            self.opt_gtol_var.get(),
             "--output",
             self.output_npz_var.get(),
         ]

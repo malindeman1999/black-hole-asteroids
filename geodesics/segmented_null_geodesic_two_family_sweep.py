@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import sys
 from dataclasses import dataclass
@@ -52,51 +53,75 @@ def _polar_to_xy(r: np.ndarray, th: np.ndarray) -> np.ndarray:
     return np.stack([rr * np.cos(tt), rr * np.sin(tt)], axis=1)
 
 
-def _segment_dt_s(rs_m: float, r0: float, r1: float, th0: float, th1: float) -> float:
-    rm = 0.5 * (float(r0) + float(r1))
-    if rm <= rs_m:
-        return float("inf")
-    g = 1.0 - rs_m / rm
-    if g <= 0.0:
-        return float("inf")
-    dr = float(r1 - r0)
-    dth = float(th1 - th0)
-    spatial_over_c2 = (dr * dr) / (g * g) + (rm * rm * dth * dth) / g
-    if spatial_over_c2 < 0.0:
-        return float("inf")
-    return sqrt(spatial_over_c2) / C
+def _segment_metric_terms(
+    rs_m: float,
+    r_nodes: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    r0 = np.asarray(r_nodes[:-1], dtype=float)
+    r1 = np.asarray(r_nodes[1:], dtype=float)
+    rm = 0.5 * (r0 + r1)
+    g = 1.0 - float(rs_m) / rm
+    if np.any(~np.isfinite(rm)) or np.any(rm <= float(rs_m)) or np.any(g <= 0.0):
+        return None
+    dr = r1 - r0
+    a_term = (dr * dr) / (g * g)
+    b_term = (rm * rm) / g
+    return rm, g, dr, a_term, b_term
 
 
-def _segment_proper_time_s(rs_m: float, r0: float, r1: float, th0: float, th1: float, dt_s: float) -> float:
-    rm = 0.5 * (float(r0) + float(r1))
-    if rm <= rs_m:
+def _travel_time_only_s_from_dtheta(dtheta: np.ndarray, a_term: np.ndarray, b_term: np.ndarray) -> float:
+    arg = a_term + b_term * (dtheta * dtheta)
+    if np.any(~np.isfinite(arg)) or np.any(arg < 0.0):
         return float("inf")
-    g = 1.0 - rs_m / rm
-    if g <= 0.0:
-        return float("inf")
-    dr = float(r1 - r0)
-    dth = float(th1 - th0)
-    ds2 = -(g * C * C * float(dt_s) * float(dt_s)) + (dr * dr) / g + (rm * rm * dth * dth)
-    # For null/spacelike interval we report zero proper-time accumulation.
-    if ds2 >= 0.0:
-        return 0.0
-    return sqrt(-ds2) / C
+    return float(np.sum(np.sqrt(arg), dtype=float) / C)
 
 
 def _travel_time_and_proper_time_s(rs_m: float, r_nodes: np.ndarray, theta_nodes: np.ndarray) -> Tuple[float, float]:
-    total_t = 0.0
-    total_tau = 0.0
-    for i in range(len(r_nodes) - 1):
-        dt = _segment_dt_s(rs_m, r_nodes[i], r_nodes[i + 1], theta_nodes[i], theta_nodes[i + 1])
-        if not np.isfinite(dt):
-            return float("inf"), float("inf")
-        dt = float(dt)
-        d_tau = _segment_proper_time_s(rs_m, r_nodes[i], r_nodes[i + 1], theta_nodes[i], theta_nodes[i + 1], dt)
-        if not np.isfinite(d_tau):
-            return float("inf"), float("inf")
-        total_t += dt
-        total_tau += float(d_tau)
-    return total_t, total_tau
+    seg = _segment_metric_terms(rs_m=rs_m, r_nodes=r_nodes)
+    if seg is None:
+        return float("inf"), float("inf")
+    rm, g, dr, a_term, b_term = seg
+    dtheta = np.asarray(theta_nodes[1:] - theta_nodes[:-1], dtype=float)
+    arg = a_term + b_term * (dtheta * dtheta)
+    if np.any(~np.isfinite(arg)) or np.any(arg < 0.0):
+        return float("inf"), float("inf")
+    sqrt_arg = np.sqrt(arg)
+    dt_seg = sqrt_arg / C
+    t_total = float(np.sum(dt_seg, dtype=float))
+    ds2 = -(g * C * C * dt_seg * dt_seg) + (dr * dr) / g + (rm * rm * dtheta * dtheta)
+    if np.any(~np.isfinite(ds2)):
+        return float("inf"), float("inf")
+    tau_seg = np.where(ds2 < 0.0, np.sqrt(np.maximum(-ds2, 0.0)) / C, 0.0)
+    tau_total = float(np.sum(tau_seg, dtype=float))
+    return t_total, tau_total
+
+
+def _path_min_radius_m(xy: np.ndarray) -> float:
+    """
+    Minimum radius from origin attained along a piecewise-linear XY path.
+    Checks both nodes and segment interiors.
+    """
+    pts = np.asarray(xy, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 1:
+        return float("inf")
+    if pts.shape[0] == 1:
+        return float(np.linalg.norm(pts[0]))
+    p0 = pts[:-1]
+    p1 = pts[1:]
+    d = p1 - p0
+    dd = np.sum(d * d, axis=1)
+    dot = np.sum(p0 * d, axis=1)
+    t = np.zeros_like(dd)
+    nz = dd > 0.0
+    t[nz] = -dot[nz] / dd[nz]
+    t = np.clip(t, 0.0, 1.0)
+    closest = p0 + d * t[:, None]
+    r2_nodes = np.sum(pts * pts, axis=1)
+    r2_seg = np.sum(closest * closest, axis=1)
+    r2_min = float(min(float(np.min(r2_nodes)), float(np.min(r2_seg))))
+    if r2_min < 0.0:
+        return float("inf")
+    return float(sqrt(r2_min))
 
 
 def _build_theta(theta_a: float, theta_b: float, theta_interior: np.ndarray) -> np.ndarray:
@@ -126,6 +151,11 @@ def _retarget_theta_warm_start(prev_theta_nodes: np.ndarray, theta_a_new: float,
     return np.asarray(th_new[1:-1], dtype=float)
 
 
+def _is_iteration_limit_message(msg: str) -> bool:
+    m = str(msg).upper()
+    return ("ITERATION" in m and "REACHED LIMIT" in m) or ("TOTAL NO. OF ITERATIONS" in m)
+
+
 def _build_path_r_nodes(a_radius_m: float, b_radius_m: float, n: int, spacing: str) -> np.ndarray:
     if int(n) < 2:
         raise ValueError("node_count must be >= 2")
@@ -134,11 +164,17 @@ def _build_path_r_nodes(a_radius_m: float, b_radius_m: float, n: int, spacing: s
     if spacing == "linear":
         return np.linspace(a, b, int(n), dtype=float)
     if spacing == "r3":
-        # Match the sweep's near-origin emphasis: approximately constant d(1/r^2),
-        # which yields local spacing law dr ~ r^3 (denser near small r).
+        # Near-origin emphasis with softened high-r collapse.
+        # Pure linear interpolation in 1/r^2 is too aggressive at large radii for
+        # wide spans (e.g., 100Rs -> 1.6Rs), causing the second node to jump to
+        # single-digit Rs and leaving no samples near mid-range (~50Rs).
+        # Warping the interpolation parameter keeps r3-style concentration near
+        # small radii but restores useful coverage across the full radial span.
         inv2_a = 1.0 / max(a * a, 1e-30)
         inv2_b = 1.0 / max(b * b, 1e-30)
-        inv2 = np.linspace(inv2_a, inv2_b, int(n), dtype=float)
+        u = np.linspace(0.0, 1.0, int(n), dtype=float)
+        u_warp = np.power(u, 2.4)
+        inv2 = inv2_a + (inv2_b - inv2_a) * u_warp
         inv2 = np.maximum(inv2, 1e-30)
         return 1.0 / np.sqrt(inv2)
     if spacing == "log":
@@ -157,8 +193,15 @@ def _optimize_thetas(
     theta0_interior: np.ndarray,
     max_iter: int,
     optimizer: str,
+    opt_ftol: float,
+    opt_gtol: float,
 ) -> Tuple[np.ndarray, float, float, bool, int, str]:
     n_int = int(len(theta0_interior))
+    seg = _segment_metric_terms(rs_m=rs_m, r_nodes=r_nodes)
+    if seg is None:
+        return np.asarray(theta0_interior, dtype=float), float("inf"), float("inf"), False, 0, "invalid segment geometry"
+    _rm, _g, _dr, a_term, b_term = seg
+
     if n_int <= 0:
         theta = _build_theta(theta_a, theta_b, np.zeros(0, dtype=float))
         t, tau = _travel_time_and_proper_time_s(rs_m, r_nodes, theta)
@@ -170,25 +213,57 @@ def _optimize_thetas(
     t_scale_s = max(float(rs_m) / C, 1e-30)
     smooth_weight_s = 1e-12
 
+    theta_full = np.empty(n_int + 2, dtype=float)
+    grad_theta = np.empty_like(theta_full)
+
+    def _fill_theta(x: np.ndarray) -> np.ndarray:
+        theta_full[0] = float(theta_a)
+        theta_full[-1] = float(theta_b)
+        theta_full[1:-1] = np.asarray(x, dtype=float)
+        return theta_full
+
     def objective(x: np.ndarray) -> float:
-        th = _build_theta(theta_a, theta_b, x)
-        t, _ = _travel_time_and_proper_time_s(rs_m, r_nodes, th)
+        th = _fill_theta(x)
+        dtheta = th[1:] - th[:-1]
+        t = _travel_time_only_s_from_dtheta(dtheta=dtheta, a_term=a_term, b_term=b_term)
         if not np.isfinite(t):
             return 1e40
-        # Small smoothness regularization keeps continuation stable.
-        d2 = np.diff(th, n=2)
+        d2 = th[2:] - 2.0 * th[1:-1] + th[:-2]
         return float((t + smooth_weight_s * np.dot(d2, d2)) / t_scale_s)
+
+    def objective_grad(x: np.ndarray) -> np.ndarray:
+        th = _fill_theta(x)
+        dtheta = th[1:] - th[:-1]
+        arg = a_term + b_term * (dtheta * dtheta)
+        if np.any(~np.isfinite(arg)) or np.any(arg <= 0.0):
+            return np.zeros(n_int, dtype=float)
+        sqrt_arg = np.sqrt(arg)
+        v = (b_term * dtheta) / (C * sqrt_arg)
+        grad_theta.fill(0.0)
+        grad_theta[:-1] -= v
+        grad_theta[1:] += v
+        d2 = th[2:] - 2.0 * th[1:-1] + th[:-2]
+        grad_theta[:-2] += 2.0 * smooth_weight_s * d2
+        grad_theta[1:-1] -= 4.0 * smooth_weight_s * d2
+        grad_theta[2:] += 2.0 * smooth_weight_s * d2
+        return np.asarray(grad_theta[1:-1] / t_scale_s, dtype=float)
 
     if optimizer == "scipy" and minimize is not None:
         lo = min(theta_a, theta_b) - 4.0 * pi
         hi = max(theta_a, theta_b) + 4.0 * pi
         bounds = [(lo, hi)] * n_int
+        g0 = objective_grad(theta0)
+        if np.all(np.isfinite(g0)) and float(np.max(np.abs(g0))) < 5e-7:
+            th0 = _build_theta(theta_a, theta_b, theta0)
+            t0, tau0 = _travel_time_and_proper_time_s(rs_m, r_nodes, th0)
+            return theta0, float(t0), float(tau0), np.isfinite(t0), 0, "warm-start accepted"
         res = minimize(
             objective,
             theta0,
+            jac=objective_grad,
             method="L-BFGS-B",
             bounds=bounds,
-            options={"maxiter": int(max_iter), "ftol": 1e-16},
+            options={"maxiter": int(max_iter), "ftol": float(opt_ftol), "gtol": float(opt_gtol)},
         )
         x = np.asarray(res.x, dtype=float)
         th = _build_theta(theta_a, theta_b, x)
@@ -241,7 +316,15 @@ class RingSolveResult:
     arrive_from_plus_xy: np.ndarray
     arrive_from_minus_xy: np.ndarray
     success_plus: np.ndarray
+    photon_safe_plus: np.ndarray
+    min_radius_plus_m: np.ndarray
     iters_plus: np.ndarray
+
+
+def _solve_ring_worker(task: Tuple[int, Dict[str, object]]) -> Tuple[int, RingSolveResult]:
+    bi, kwargs = task
+    rr = solve_ring_for_b_radius(**kwargs)
+    return int(bi), rr
 
 
 def solve_ring_for_b_radius(
@@ -255,6 +338,10 @@ def solve_ring_for_b_radius(
     node_spacing: str = "r3",
     optimizer: str = "scipy",
     max_iter: int = 250,
+    opt_ftol: float = 1e-9,
+    opt_gtol: float = 1e-6,
+    adaptive_iter: bool = True,
+    fail_fast_series: bool = True,
     debug_show_paths: bool = False,
     debug_pause: bool = False,
 ) -> RingSolveResult:
@@ -294,12 +381,18 @@ def solve_ring_for_b_radius(
     from_plus = np.full((a_phi.size, 2), np.nan, dtype=float)
     from_minus = np.full((a_phi.size, 2), np.nan, dtype=float)
     ok_plus = np.zeros(a_phi.size, dtype=bool)
+    photon_safe_plus = np.zeros(a_phi.size, dtype=bool)
+    min_radius_plus_m = np.full(a_phi.size, np.nan, dtype=float)
     iters = np.zeros(a_phi.size, dtype=np.int32)
+    r_ph = 1.5 * float(rs_m)
 
     n_int = node_count - 2
     prev_theta_nodes = _build_theta(0.0, 0.0, np.zeros(n_int, dtype=float))
+    prev_n_it = max(8, int(max_iter) // 4)
+    solve_indices = list(range(a_phi.size))
 
-    for i, phi_a in enumerate(a_phi):
+    for i in solve_indices:
+        phi_a = float(a_phi[i])
         theta_a = float(phi_a)
         theta_b = 0.0
 
@@ -309,22 +402,58 @@ def solve_ring_for_b_radius(
         else:
             theta0_interior = _retarget_theta_warm_start(prev_theta_nodes, theta_a_new=theta_a, theta_b_new=theta_b)
 
-        x_opt, t_s, tau_s, ok, n_it, _ = _optimize_thetas(
+        max_iter_local = int(max_iter)
+        if adaptive_iter and i > 0:
+            max_iter_local = min(int(max_iter), max(18, int(1.5 * prev_n_it) + 8))
+
+        x_opt, t_s, tau_s, ok, n_it, opt_msg = _optimize_thetas(
             rs_m=rs_m,
             r_nodes=r_nodes,
             theta_a=theta_a,
             theta_b=theta_b,
             theta0_interior=theta0_interior,
-            max_iter=max_iter,
+            max_iter=max_iter_local,
             optimizer=optimizer,
+            opt_ftol=opt_ftol,
+            opt_gtol=opt_gtol,
         )
+        if (not bool(ok)) and (optimizer == "scipy") and _is_iteration_limit_message(str(opt_msg)):
+            retry_interior = np.asarray(x_opt, dtype=float)
+            retry_budget = int(max_iter_local)
+            for _retry in range(2):
+                retry_budget = min(max(50, 2 * retry_budget), max(50, 8 * int(max_iter)))
+                x_opt2, t_s2, tau_s2, ok2, n_it2, opt_msg2 = _optimize_thetas(
+                    rs_m=rs_m,
+                    r_nodes=r_nodes,
+                    theta_a=theta_a,
+                    theta_b=theta_b,
+                    theta0_interior=retry_interior,
+                    max_iter=retry_budget,
+                    optimizer=optimizer,
+                    opt_ftol=opt_ftol,
+                    opt_gtol=opt_gtol,
+                )
+                x_opt, t_s, tau_s, ok, n_it, opt_msg = x_opt2, t_s2, tau_s2, ok2, n_it2, opt_msg2
+                retry_interior = np.asarray(x_opt, dtype=float)
+                if bool(ok):
+                    print(
+                        "[retry] "
+                        f"B={b_radius_m/rs_m:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | "
+                        f"resolved iteration cap with max_iter={retry_budget}.",
+                        flush=True,
+                    )
+                    break
         theta_nodes = _build_theta(theta_a, theta_b, x_opt)
         xy = _polar_to_xy(r_nodes, theta_nodes)
 
         path_plus[i, :, :] = xy
         t_plus[i] = t_s
         tau_plus[i] = tau_s
-        ok_plus[i] = bool(ok)
+        min_r = _path_min_radius_m(xy)
+        min_radius_plus_m[i] = float(min_r)
+        photon_safe = bool(np.isfinite(min_r) and (min_r >= r_ph))
+        photon_safe_plus[i] = photon_safe
+        ok_plus[i] = bool(ok) and photon_safe
         iters[i] = int(n_it)
 
         emit = _unit_xy(xy[1, :] - xy[0, :])
@@ -342,7 +471,27 @@ def solve_ring_for_b_radius(
         emit_minus[i, :] = _unit_xy(np.asarray([emit[0], -emit[1]], dtype=float))
         from_minus[i, :] = _unit_xy(np.asarray([come_from[0], -come_from[1]], dtype=float))
 
+        current_ok = bool(ok) and bool(photon_safe)
         prev_theta_nodes = theta_nodes.copy()
+        prev_n_it = max(1, int(n_it))
+
+        if fail_fast_series and (not current_ok):
+            if not bool(ok):
+                reason = f"optimizer failed ({str(opt_msg)})"
+            elif not bool(photon_safe):
+                reason = (
+                    "photon-sphere violation "
+                    f"(min_r={min_r/rs_m:.6f} Rs < 1.500000 Rs)"
+                )
+            else:
+                reason = "unknown failure"
+            print(
+                "[fail-fast] "
+                f"B={b_radius_m/rs_m:.6f} Rs | idx={i} | phi_a={theta_a:.6f} rad | {reason}. "
+                "Stopping remaining paths in this ring.",
+                flush=True,
+            )
+            break
 
     if debug_show_paths:
         plt, plot_err = _load_debug_pyplot()
@@ -362,6 +511,8 @@ def solve_ring_for_b_radius(
                 arrive_from_plus_xy=from_plus,
                 arrive_from_minus_xy=from_minus,
                 success_plus=ok_plus,
+                photon_safe_plus=photon_safe_plus,
+                min_radius_plus_m=min_radius_plus_m,
                 iters_plus=iters,
             )
 
@@ -403,6 +554,8 @@ def solve_ring_for_b_radius(
         arrive_from_plus_xy=from_plus,
         arrive_from_minus_xy=from_minus,
         success_plus=ok_plus,
+        photon_safe_plus=photon_safe_plus,
+        min_radius_plus_m=min_radius_plus_m,
         iters_plus=iters,
     )
 
@@ -418,6 +571,11 @@ def solve_b_radial_series(
     node_spacing: str,
     optimizer: str,
     max_iter: int,
+    opt_ftol: float,
+    opt_gtol: float,
+    adaptive_iter: bool,
+    fail_fast_series: bool,
+    workers: int,
     debug_show_rings: bool,
     debug_pause_rings: bool,
 ) -> Dict[str, np.ndarray]:
@@ -436,6 +594,10 @@ def solve_b_radial_series(
         node_spacing=node_spacing,
         optimizer=optimizer,
         max_iter=max_iter,
+        opt_ftol=opt_ftol,
+        opt_gtol=opt_gtol,
+        adaptive_iter=adaptive_iter,
+        fail_fast_series=fail_fast_series,
         debug_show_paths=debug_show_rings,
         debug_pause=debug_pause_rings,
     )
@@ -455,6 +617,8 @@ def solve_b_radial_series(
     from_plus = np.full((n_b, n_a, 2), np.nan, dtype=float)
     from_minus = np.full((n_b, n_a, 2), np.nan, dtype=float)
     ok_plus = np.zeros((n_b, n_a), dtype=bool)
+    photon_safe_plus = np.zeros((n_b, n_a), dtype=bool)
+    min_radius_plus_m = np.full((n_b, n_a), np.nan, dtype=float)
     iters_plus = np.zeros((n_b, n_a), dtype=np.int32)
 
     def _assign(bi: int, rr: RingSolveResult) -> None:
@@ -469,26 +633,66 @@ def solve_b_radial_series(
         from_plus[bi] = rr.arrive_from_plus_xy
         from_minus[bi] = rr.arrive_from_minus_xy
         ok_plus[bi] = rr.success_plus
+        photon_safe_plus[bi] = rr.photon_safe_plus
+        min_radius_plus_m[bi] = rr.min_radius_plus_m
         iters_plus[bi] = rr.iters_plus
 
     _assign(0, ring0)
 
-    for bi in range(1, n_b):
-        rr = solve_ring_for_b_radius(
-            rs_m=rs_m,
-            a_radius_m=a_radius_m,
-            b_radius_m=float(b_vals[bi]),
-            a_phi_count=a_phi_count,
-            a_phi_second_rad=a_phi_second_rad,
-            a_phi_step_rad=a_phi_step_rad,
-            node_count=node_count,
-            node_spacing=node_spacing,
-            optimizer=optimizer,
-            max_iter=max_iter,
-            debug_show_paths=debug_show_rings,
-            debug_pause=debug_pause_rings,
-        )
-        _assign(bi, rr)
+    n_workers = int(workers)
+    if n_workers <= 0:
+        n_workers = min(max(1, (os.cpu_count() or 1) - 1), int(max(1, n_b - 1)))
+
+    if (n_b <= 1) or debug_show_rings or (n_workers <= 1):
+        for bi in range(1, n_b):
+            rr = solve_ring_for_b_radius(
+                rs_m=rs_m,
+                a_radius_m=a_radius_m,
+                b_radius_m=float(b_vals[bi]),
+                a_phi_count=a_phi_count,
+                a_phi_second_rad=a_phi_second_rad,
+                a_phi_step_rad=a_phi_step_rad,
+                node_count=node_count,
+                node_spacing=node_spacing,
+                optimizer=optimizer,
+                max_iter=max_iter,
+                opt_ftol=opt_ftol,
+                opt_gtol=opt_gtol,
+                adaptive_iter=adaptive_iter,
+                fail_fast_series=fail_fast_series,
+                debug_show_paths=debug_show_rings,
+                debug_pause=debug_pause_rings,
+            )
+            _assign(bi, rr)
+    else:
+        tasks: List[Tuple[int, Dict[str, object]]] = []
+        for bi in range(1, n_b):
+            tasks.append(
+                (
+                    int(bi),
+                    {
+                        "rs_m": float(rs_m),
+                        "a_radius_m": float(a_radius_m),
+                        "b_radius_m": float(b_vals[bi]),
+                        "a_phi_count": int(a_phi_count),
+                        "a_phi_second_rad": a_phi_second_rad,
+                        "a_phi_step_rad": a_phi_step_rad,
+                        "node_count": int(node_count),
+                        "node_spacing": str(node_spacing),
+                        "optimizer": str(optimizer),
+                        "max_iter": int(max_iter),
+                        "opt_ftol": float(opt_ftol),
+                        "opt_gtol": float(opt_gtol),
+                        "adaptive_iter": bool(adaptive_iter),
+                        "fail_fast_series": bool(fail_fast_series),
+                        "debug_show_paths": False,
+                        "debug_pause": False,
+                    },
+                )
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for bi, rr in ex.map(_solve_ring_worker, tasks):
+                _assign(int(bi), rr)
 
     return {
         "rs_m": np.asarray(rs_m, dtype=float),
@@ -506,6 +710,8 @@ def solve_b_radial_series(
         "arrive_from_plus_xy": from_plus,
         "arrive_from_minus_xy": from_minus,
         "success_plus": ok_plus,
+        "photon_safe_plus": photon_safe_plus,
+        "min_radius_plus_m": min_radius_plus_m,
         "iters_plus": iters_plus,
     }
 
@@ -596,6 +802,36 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--optimizer", choices=["scipy", "coord"], default="scipy")
     p.add_argument("--max-iter", type=int, default=250)
+    p.add_argument(
+        "--opt-ftol",
+        type=float,
+        default=1e-9,
+        help="L-BFGS-B objective tolerance (default: 1e-9).",
+    )
+    p.add_argument(
+        "--opt-gtol",
+        type=float,
+        default=1e-6,
+        help="L-BFGS-B projected-gradient tolerance (default: 1e-6).",
+    )
+    p.add_argument(
+        "--adaptive-iter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt per-angle max iterations from previous continuation solve (default: on).",
+    )
+    p.add_argument(
+        "--fail-fast-series",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop A-phi continuation immediately after first failed path in a ring (default: on).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="B-ring worker processes. 0=auto, 1=serial, >1=parallel (default: 0).",
+    )
     p.add_argument("--debug-show-rings", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--debug-pause-rings", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
@@ -649,6 +885,11 @@ def main() -> None:
         node_spacing=str(args.node_spacing),
         optimizer=str(args.optimizer),
         max_iter=int(args.max_iter),
+        opt_ftol=float(args.opt_ftol),
+        opt_gtol=float(args.opt_gtol),
+        adaptive_iter=bool(args.adaptive_iter),
+        fail_fast_series=bool(args.fail_fast_series),
+        workers=int(args.workers),
         debug_show_rings=bool(args.debug_show_rings),
         debug_pause_rings=bool(args.debug_pause_rings),
     )
@@ -658,10 +899,12 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output, **out)
     print(f"Saved: {args.output}")
+    n_photo_viol = int(np.count_nonzero(~np.asarray(out["photon_safe_plus"], dtype=bool)))
     print(
         "Solve summary: "
         f"B_rings={out['b_radii_m'].size}, A_phi={out['a_phi_rad'].size}, "
-        f"nodes={int(args.node_count)}, success={int(np.count_nonzero(out['success_plus']))}/{out['success_plus'].size}"
+        f"nodes={int(args.node_count)}, success={int(np.count_nonzero(out['success_plus']))}/{out['success_plus'].size}, "
+        f"photon_violations={n_photo_viol}"
     )
 
 
