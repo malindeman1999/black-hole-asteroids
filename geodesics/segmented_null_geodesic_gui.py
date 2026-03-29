@@ -47,10 +47,10 @@ class SegmentedNullGeodesicGUI:
         self.opt_ftol_var = tk.StringVar(value="1e-9")
         self.opt_gtol_var = tk.StringVar(value="1e-6")
         self.output_npz_var = tk.StringVar(
-            value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_sweep.npz")
+            value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_sky_sweep.npz")
         )
         self.output_near_npz_var = tk.StringVar(
-            value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_near_a_b_sweep.npz")
+            value=str(PROJECT_ROOT / "data" / "segmented_null_geodesic_two_family_local_sweep.npz")
         )
         self.scale_var = tk.StringVar(value="")
 
@@ -69,8 +69,8 @@ class SegmentedNullGeodesicGUI:
             ("Max Iter", self.max_iter_var),
             ("Opt Ftol", self.opt_ftol_var),
             ("Opt Gtol", self.opt_gtol_var),
-            ("Output NPZ", self.output_npz_var),
-            ("Output NPZ (Near A/B)", self.output_near_npz_var),
+            ("Output NPZ (Sky)", self.output_npz_var),
+            ("Output NPZ (Local)", self.output_near_npz_var),
         ]:
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
             ttk.Entry(frame, textvariable=var, width=96).grid(row=row, column=1, sticky="ew", pady=2)
@@ -96,10 +96,10 @@ class SegmentedNullGeodesicGUI:
 
         btn_row = ttk.Frame(frame)
         btn_row.grid(row=row, column=1, sticky="w", pady=(2, 8))
-        self.btn_run = ttk.Button(btn_row, text="Run Sweep", command=self.run_sweep)
-        self.btn_run_debug = ttk.Button(btn_row, text="Run Sweep (Debug)", command=self.run_sweep_debug)
-        self.btn_plot_times = ttk.Button(btn_row, text="Plot Times", command=self.plot_times)
-        self.btn_plot_paths_pdf = ttk.Button(btn_row, text="Plot Paths PDF", command=self.plot_paths_pdf)
+        self.btn_run = ttk.Button(btn_row, text="Run Sky Sweep", command=self.run_sweep)
+        self.btn_run_debug = ttk.Button(btn_row, text="Run Sky Sweep (Debug)", command=self.run_sweep_debug)
+        self.btn_plot_times = ttk.Button(btn_row, text="Plot Sky Times", command=self.plot_times)
+        self.btn_plot_paths_pdf = ttk.Button(btn_row, text="Plot Sky Paths PDF", command=self.plot_paths_pdf)
         self.btn_stop = ttk.Button(btn_row, text="Stop", command=self.stop_current)
         for b in [self.btn_run, self.btn_run_debug, self.btn_plot_times, self.btn_plot_paths_pdf, self.btn_stop]:
             b.pack(side=tk.LEFT, padx=(0, 6))
