@@ -24,6 +24,7 @@ class RayTracingGUI:
     DEFAULTS_PATH = Path(__file__).resolve().parent / "gui_defaults.json"
     MULTI_SEQS_DEFAULT_PATH = Path(__file__).resolve().parent / "multi_sequences_cache.npz"
     INTERP_TABLE_DEFAULT_PATH = Path(__file__).resolve().parent / "multi_sequences_interp_table.npz"
+    SKY_INTERP_TABLE_DEFAULT_PATH = Path(__file__).resolve().parent / "sky_interp_table.npz"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -37,8 +38,10 @@ class RayTracingGUI:
         self._draw_empty()
 
     def _build_controls(self) -> None:
-        frame = ttk.Frame(self.root, padding=10)
+        frame = ttk.Frame(self.root, padding=8)
         frame.pack(side=tk.TOP, fill=tk.X)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
         self.angle_deg_var = tk.StringVar(value="90")
         self.rs_ls_var = tk.StringVar(value="1")
@@ -59,86 +62,104 @@ class RayTracingGUI:
         self.heatmap_res_mult_var = tk.StringVar(value="10")
         self.interp_vec_res_mult_var = tk.StringVar(value="1")
         self.interp_file_path_var = tk.StringVar(value=str(self.INTERP_TABLE_DEFAULT_PATH))
+        self.sky_interp_file_path_var = tk.StringVar(value=str(self.SKY_INTERP_TABLE_DEFAULT_PATH))
         self.show_ticks_var = tk.BooleanVar(value=True)
         self.show_lookback_vec_var = tk.BooleanVar(value=False)
         self.show_final_light_vec_var = tk.BooleanVar(value=False)
         self.show_tick_light_vec_var = tk.BooleanVar(value=False)
 
-        ttk.Label(frame, text="Common Settings", font=("", 10, "bold")).grid(
-            row=0, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 2)
-        )
-        ttk.Label(frame, text="Rs (light-seconds)").grid(row=1, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.rs_ls_var, width=14).grid(row=2, column=0, sticky="w", padx=5)
-        ttk.Label(frame, text="Back Time Threshold (s)").grid(row=1, column=1, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.back_time_s_var, width=14).grid(row=2, column=1, sticky="w", padx=5)
-        ttk.Label(frame, text="Observer B x-position (Rs)").grid(row=1, column=2, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.bx_rs_var, width=14).grid(row=2, column=2, sticky="w", padx=5)
-        ttk.Label(frame, text="Endpoint Threshold (Rs)").grid(row=1, column=3, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.endpoint_thresh_rs_var, width=14).grid(row=2, column=3, sticky="w", padx=5)
-        ttk.Checkbutton(frame, text="Show Ticks", variable=self.show_ticks_var).grid(row=2, column=4, sticky="w", padx=5)
-        ttk.Checkbutton(frame, text="Show Look-Back Vec", variable=self.show_lookback_vec_var).grid(row=2, column=5, sticky="w", padx=5)
-        ttk.Checkbutton(frame, text="Show Final Light Vec", variable=self.show_final_light_vec_var).grid(row=2, column=6, sticky="w", padx=5)
-        ttk.Checkbutton(frame, text="Show Tick Light Vec", variable=self.show_tick_light_vec_var).grid(row=2, column=7, sticky="w", padx=5)
-        ttk.Button(frame, text="Save Defaults", command=self._save_defaults).grid(row=2, column=8, sticky="w", padx=8)
+        common = ttk.LabelFrame(frame, text="Common")
+        common.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+        for col in (1, 3, 5, 7):
+            common.columnconfigure(col, weight=1)
+        ttk.Label(common, text="Rs (ls)").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(common, textvariable=self.rs_ls_var, width=8).grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        ttk.Label(common, text="Back Time (s)").grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        ttk.Entry(common, textvariable=self.back_time_s_var, width=8).grid(row=0, column=3, sticky="we", padx=4, pady=2)
+        ttk.Label(common, text="B x (Rs)").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(common, textvariable=self.bx_rs_var, width=8).grid(row=1, column=1, sticky="we", padx=4, pady=2)
+        ttk.Label(common, text="Endpt Seperation Thresh (Rs)").grid(row=1, column=2, sticky="w", padx=4, pady=2)
+        ttk.Entry(common, textvariable=self.endpoint_thresh_rs_var, width=8).grid(row=1, column=3, sticky="we", padx=4, pady=2)
+        ttk.Button(common, text="Save Defaults", command=self._save_defaults).grid(row=0, column=4, rowspan=2, sticky="nsw", padx=8, pady=2)
 
-        ttk.Separator(frame, orient="horizontal").grid(row=3, column=0, columnspan=9, sticky="ew", padx=5, pady=(8, 8))
-        ttk.Label(frame, text="Single Trajectory", font=("", 10, "bold")).grid(
-            row=4, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 2)
-        )
-        ttk.Label(frame, text="Look Angle at B (deg)").grid(row=5, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.angle_deg_var, width=14).grid(row=6, column=0, sticky="w", padx=5)
-        ttk.Button(frame, text="Solve + Plot Single", command=self._solve_and_plot_single).grid(row=6, column=1, sticky="w", padx=12)
+        toggles = ttk.Frame(common)
+        toggles.grid(row=2, column=0, columnspan=5, sticky="w", padx=2, pady=(2, 4))
+        ttk.Checkbutton(toggles, text="Ticks", variable=self.show_ticks_var).grid(row=0, column=0, sticky="w", padx=4)
+        ttk.Checkbutton(toggles, text="Look-Back Vec", variable=self.show_lookback_vec_var).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(toggles, text="Final Light Vec", variable=self.show_final_light_vec_var).grid(row=0, column=2, sticky="w", padx=4)
+        ttk.Checkbutton(toggles, text="Tick Light Vec", variable=self.show_tick_light_vec_var).grid(row=0, column=3, sticky="w", padx=4)
 
-        ttk.Separator(frame, orient="horizontal").grid(row=7, column=0, columnspan=9, sticky="ew", padx=5, pady=(8, 8))
-        ttk.Label(frame, text="Multiple Trajectories", font=("", 10, "bold")).grid(
-            row=8, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 2)
-        )
-        ttk.Label(frame, text="Max Recursion").grid(row=9, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.max_recursion_var, width=14).grid(row=10, column=0, sticky="w", padx=5)
-        ttk.Label(frame, text="B range min (Rs)").grid(row=9, column=1, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.b_range_min_rs_var, width=14).grid(row=10, column=1, sticky="w", padx=5)
-        ttk.Label(frame, text="B range max (Rs)").grid(row=9, column=2, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.b_range_max_rs_var, width=14).grid(row=10, column=2, sticky="w", padx=5)
-        ttk.Label(frame, text="B count").grid(row=9, column=3, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.b_range_count_var, width=10).grid(row=10, column=3, sticky="w", padx=5)
-        ttk.Button(frame, text="Solve+Plot 1 Seq", command=self._solve_and_plot_multi).grid(row=10, column=4, sticky="w", padx=8)
-        ttk.Button(frame, text="Solve Seqs -> File", command=self._solve_sequences_to_file).grid(row=10, column=5, sticky="w", padx=8)
-        ttk.Button(frame, text="Plot From File", command=self._plot_sequences_from_file).grid(row=10, column=6, sticky="w", padx=8)
-        ttk.Label(frame, text="Seq File").grid(row=9, column=7, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.multi_file_path_var, width=28).grid(row=10, column=7, columnspan=2, sticky="w", padx=5)
+        single = ttk.LabelFrame(frame, text="Single Trajectory")
+        single.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        ttk.Label(single, text="Look Angle (deg)").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(single, textvariable=self.angle_deg_var, width=10).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Button(single, text="Solve + Plot Single", command=self._solve_and_plot_single).grid(row=0, column=2, sticky="w", padx=8, pady=2)
 
-        ttk.Separator(frame, orient="horizontal").grid(row=11, column=0, columnspan=9, sticky="ew", padx=5, pady=(8, 8))
-        ttk.Label(frame, text="Interpolation Tables", font=("", 10, "bold")).grid(
-            row=12, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 2)
-        )
-        ttk.Label(frame, text="r min (Rs)").grid(row=13, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_r_min_rs_var, width=10).grid(row=14, column=0, sticky="w", padx=5)
-        ttk.Label(frame, text="r max (Rs)").grid(row=13, column=1, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_r_max_rs_var, width=10).grid(row=14, column=1, sticky="w", padx=5)
-        ttk.Label(frame, text="r count").grid(row=13, column=2, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_r_count_var, width=10).grid(row=14, column=2, sticky="w", padx=5)
-        ttk.Label(frame, text="theta min (deg)").grid(row=13, column=3, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_theta_min_deg_var, width=12).grid(row=14, column=3, sticky="w", padx=5)
-        ttk.Label(frame, text="theta max (deg)").grid(row=13, column=4, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_theta_max_deg_var, width=12).grid(row=14, column=4, sticky="w", padx=5)
-        ttk.Label(frame, text="theta count").grid(row=13, column=5, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_theta_count_var, width=10).grid(row=14, column=5, sticky="w", padx=5)
-        ttk.Label(frame, text="Heatmap Res x").grid(row=13, column=6, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.heatmap_res_mult_var, width=10).grid(row=14, column=6, sticky="w", padx=5)
-        ttk.Label(frame, text="Vector Res x").grid(row=15, column=6, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_vec_res_mult_var, width=10).grid(row=16, column=6, sticky="w", padx=5)
-        ttk.Label(frame, text="Interp File").grid(row=13, column=7, sticky="w", padx=5, pady=4)
-        ttk.Entry(frame, textvariable=self.interp_file_path_var, width=24).grid(row=14, column=7, columnspan=2, sticky="w", padx=5)
-        ttk.Button(frame, text="Build Table", command=self._build_interp_table_from_saved_sequences).grid(row=13, column=8, sticky="w", padx=8)
-        ttk.Button(frame, text="Plot Back-Time Heatmap", command=self._plot_back_time_heatmap_from_interp).grid(
-            row=14, column=8, sticky="w", padx=8
-        )
-        ttk.Button(frame, text="Plot Propagation Vectors", command=self._plot_propagation_vectors_from_interp).grid(
-            row=15, column=8, sticky="w", padx=8
-        )
+        multi = ttk.LabelFrame(frame, text="Multiple Trajectories")
+        multi.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=0, pady=(0, 4))
+        multi.columnconfigure(9, weight=1)
+        ttk.Label(multi, text="Max Rec").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(multi, textvariable=self.max_recursion_var, width=7).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Label(multi, text="B min").grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        ttk.Entry(multi, textvariable=self.b_range_min_rs_var, width=7).grid(row=0, column=3, sticky="w", padx=4, pady=2)
+        ttk.Label(multi, text="B max").grid(row=0, column=4, sticky="w", padx=4, pady=2)
+        ttk.Entry(multi, textvariable=self.b_range_max_rs_var, width=7).grid(row=0, column=5, sticky="w", padx=4, pady=2)
+        ttk.Label(multi, text="B n").grid(row=0, column=6, sticky="w", padx=4, pady=2)
+        ttk.Entry(multi, textvariable=self.b_range_count_var, width=7).grid(row=0, column=7, sticky="w", padx=4, pady=2)
+        ttk.Button(multi, text="Solve+Plot 1 Seq", command=self._solve_and_plot_multi).grid(row=0, column=8, sticky="w", padx=(8, 4), pady=2)
+        ttk.Button(multi, text="Solve Seqs -> File", command=self._solve_sequences_to_file).grid(row=0, column=9, sticky="w", padx=4, pady=2)
+        ttk.Button(multi, text="Plot From File", command=self._plot_sequences_from_file).grid(row=0, column=10, sticky="w", padx=4, pady=2)
+        ttk.Label(multi, text="Seq File").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(multi, textvariable=self.multi_file_path_var).grid(row=1, column=1, columnspan=10, sticky="we", padx=4, pady=2)
+
+        interp = ttk.LabelFrame(frame, text="Interpolation Tables")
+        interp.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=0, pady=(0, 2))
+        interp.columnconfigure(1, weight=1)
+        interp.columnconfigure(3, weight=1)
+        interp.columnconfigure(5, weight=1)
+        interp.columnconfigure(7, weight=1)
+
+        ranges = ttk.Frame(interp)
+        ranges.grid(row=0, column=0, columnspan=2, sticky="we", padx=2, pady=(2, 4))
+        for col in (1, 3, 5, 7, 9, 11, 13, 15):
+            ranges.columnconfigure(col, weight=1)
+        ttk.Label(ranges, text="r min").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_r_min_rs_var, width=7).grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="r max").grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_r_max_rs_var, width=7).grid(row=0, column=3, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="r n").grid(row=0, column=4, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_r_count_var, width=7).grid(row=0, column=5, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="th min").grid(row=0, column=6, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_theta_min_deg_var, width=7).grid(row=0, column=7, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="th max").grid(row=0, column=8, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_theta_max_deg_var, width=7).grid(row=0, column=9, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="th n").grid(row=0, column=10, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_theta_count_var, width=7).grid(row=0, column=11, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="Heat x").grid(row=0, column=12, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.heatmap_res_mult_var, width=7).grid(row=0, column=13, sticky="we", padx=4, pady=2)
+        ttk.Label(ranges, text="Vec x").grid(row=0, column=14, sticky="w", padx=4, pady=2)
+        ttk.Entry(ranges, textvariable=self.interp_vec_res_mult_var, width=7).grid(row=0, column=15, sticky="we", padx=4, pady=2)
+
+        local_ops = ttk.LabelFrame(interp, text="Local Table")
+        local_ops.grid(row=1, column=0, sticky="nsew", padx=(2, 4), pady=2)
+        local_ops.columnconfigure(1, weight=1)
+        ttk.Label(local_ops, text="File").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(local_ops, textvariable=self.interp_file_path_var).grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        ttk.Button(local_ops, text="Build Local Table", command=self._build_interp_table_from_saved_sequences).grid(row=1, column=0, sticky="w", padx=4, pady=(2, 4))
+        ttk.Button(local_ops, text="Back-Time Heatmap", command=self._plot_back_time_heatmap_from_interp).grid(row=1, column=1, sticky="w", padx=4, pady=(2, 4))
+        ttk.Button(local_ops, text="Propagation Vectors", command=self._plot_propagation_vectors_from_interp).grid(row=1, column=2, sticky="w", padx=4, pady=(2, 4))
+
+        sky_ops = ttk.LabelFrame(interp, text="Sky Table")
+        sky_ops.grid(row=1, column=1, sticky="nsew", padx=(4, 2), pady=2)
+        sky_ops.columnconfigure(1, weight=1)
+        ttk.Label(sky_ops, text="File").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Entry(sky_ops, textvariable=self.sky_interp_file_path_var).grid(row=0, column=1, sticky="we", padx=4, pady=2)
+        ttk.Button(sky_ops, text="Build Sky Table", command=self._build_sky_interp_table_from_saved_sequences).grid(row=1, column=0, sticky="w", padx=4, pady=(2, 4))
+        ttk.Button(sky_ops, text="Sky->Look Mapping", command=self._plot_sky_to_look_mapping).grid(row=1, column=1, sticky="w", padx=4, pady=(2, 4))
+        ttk.Button(sky_ops, text="Plot Table Pairs", command=self._plot_sky_table_pairs).grid(row=1, column=2, sticky="w", padx=4, pady=(2, 4))
 
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frame, textvariable=self.status_var).grid(row=17, column=0, columnspan=9, sticky="w", padx=5, pady=(8, 0))
+        ttk.Label(frame, textvariable=self.status_var).grid(row=3, column=0, columnspan=2, sticky="we", padx=4, pady=(6, 0))
 
         self._load_defaults()
 
@@ -628,6 +649,237 @@ class RayTracingGUI:
             f"theta_range=[{th_min:.3g}, {th_max:.3g}] deg"
         )
 
+    def _build_sky_interp_table_from_saved_sequences(self) -> None:
+        seq_file = Path(self.multi_file_path_var.get().strip())
+        if not seq_file.exists():
+            messagebox.showerror("Load Error", f"Sequence file not found:\n{seq_file}")
+            return
+        out_file = Path(self.sky_interp_file_path_var.get().strip())
+        if not str(out_file):
+            messagebox.showerror("Input Error", "Sky interp file path cannot be empty.")
+            return
+
+        try:
+            th_min = float(self.interp_theta_min_deg_var.get().strip())
+            th_max = float(self.interp_theta_max_deg_var.get().strip())
+            th_count = int(self.interp_theta_count_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Input Error", "Interpolation controls must be valid numbers.")
+            return
+        if th_count < 1:
+            messagebox.showerror("Input Error", "theta count must be >= 1.")
+            return
+
+        try:
+            data = np.load(seq_file, allow_pickle=True)
+            b_values = np.asarray(data["b_values_rs"], dtype=float)
+            angles_rows = np.asarray(data["angles_deg"], dtype=object)
+            xs_rows = np.asarray(data["xs"], dtype=object)
+            ys_rows = np.asarray(data["ys"], dtype=object)
+            ts_rows = np.asarray(data["ts_s"], dtype=object)
+            metadata_raw = data.get("metadata_json", np.asarray("", dtype=object))
+            metadata_in = json.loads(str(metadata_raw.item())) if np.size(metadata_raw) > 0 else {}
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Failed to load sequence file:\n{exc}")
+            return
+
+        n_b = int(b_values.size)
+        if n_b < 1:
+            messagebox.showerror("Load Error", "Sequence file contains no B positions.")
+            return
+
+        theta_periodic = False
+        th_grid_deg = np.linspace(th_min, th_max, th_count, endpoint=True, dtype=float)
+        n_th = int(th_grid_deg.size)
+
+        sky_unit = np.full((n_b, n_th, 2), np.nan, dtype=float)
+        look_unit = np.full((n_b, n_th, 2), np.nan, dtype=float)
+        back_time_s = np.full((n_b, n_th), np.nan, dtype=float)
+        valid = np.zeros((n_b, n_th), dtype=bool)
+
+        total_interp = n_b * n_th
+        interp_done = 0
+        total_truncated = 0
+
+        self.status_var.set(f"sky-table: preparing trajectories for {n_b} B positions...")
+        self.root.update_idletasks()
+
+        for bi in range(n_b):
+            angles = np.asarray(angles_rows[bi], dtype=float)
+            row_xs = np.asarray(xs_rows[bi], dtype=object)
+            row_ys = np.asarray(ys_rows[bi], dtype=object)
+            row_ts = np.asarray(ts_rows[bi], dtype=object)
+
+            n_traj = int(angles.size)
+            theta_end_list: list[float] = []
+            sky_end_list: list[np.ndarray] = []
+            look_end_list: list[np.ndarray] = []
+            bt_end_list: list[float] = []
+
+            for ti in range(n_traj):
+                xs = np.asarray(row_xs[ti], dtype=float)
+                ys = np.asarray(row_ys[ti], dtype=float)
+                ts = np.asarray(row_ts[ti], dtype=float)
+                if xs.size < 2 or ys.size < 2 or ts.size < 2:
+                    continue
+                ang = float(np.deg2rad(angles[ti]))
+                look_vec = np.asarray([np.cos(ang), np.sin(ang)], dtype=float)
+                prop_xy = self._compute_prop_dirs_along_curve(xs, ys)
+                sky_vec = -np.asarray(prop_xy[-1, :], dtype=float)
+                theta_curve_deg = np.rad2deg(np.unwrap(np.arctan2(ys, xs)))
+                theta_end = float(theta_curve_deg[-1])
+                nsky = float(np.hypot(sky_vec[0], sky_vec[1]))
+                if nsky <= 1e-12:
+                    continue
+                sky_vec = sky_vec / nsky
+                theta_end_list.append(theta_end)
+                sky_end_list.append(sky_vec)
+                look_end_list.append(look_vec)
+                bt_end_list.append(float(-ts[-1]))
+
+            self.status_var.set(f"sky-table: interpolating B {bi + 1}/{n_b}...")
+            self.root.update_idletasks()
+
+            theta_end_arr = np.asarray(theta_end_list, dtype=float)
+            sky_end_arr = np.asarray(sky_end_list, dtype=float) if sky_end_list else np.zeros((0, 2), dtype=float)
+            look_end_arr = np.asarray(look_end_list, dtype=float) if look_end_list else np.zeros((0, 2), dtype=float)
+            bt_end_arr = np.asarray(bt_end_list, dtype=float) if bt_end_list else np.zeros((0,), dtype=float)
+
+            for thi, th_deg in enumerate(th_grid_deg):
+                ok, lb_xy, bt_s, sky_xy = self._interpolate_from_theta_endpoints(
+                    theta_end_deg=theta_end_arr,
+                    look_dirs=look_end_arr,
+                    sky_dirs=sky_end_arr,
+                    back_times=bt_end_arr,
+                    query_theta_deg=float(th_deg),
+                )
+                if ok:
+                    look_unit[bi, thi, :] = lb_xy
+                    sky_unit[bi, thi, :] = sky_xy
+                    back_time_s[bi, thi] = bt_s
+                    valid[bi, thi] = True
+                interp_done += 1
+                if interp_done % 200 == 0 or interp_done == total_interp:
+                    self.status_var.set(
+                        f"sky-table: progress {interp_done}/{total_interp} "
+                        f"({100.0 * interp_done / max(1, total_interp):.1f}%)"
+                    )
+                    self.root.update_idletasks()
+
+            total_truncated += self._truncate_sky_row_after_wrap(
+                sky_row=sky_unit[bi],
+                look_row=look_unit[bi],
+                bt_row=back_time_s[bi],
+                valid_row=valid[bi],
+            )
+
+        meta_out = {
+            "kind": "ray_tracing_sky_interp_table_v1",
+            "source_sequence_file": str(seq_file),
+            "source_metadata": metadata_in,
+            "r_used_rs": "threshold_endpoint",
+            "theta_min_deg": float(th_min),
+            "theta_max_deg": float(th_max),
+            "theta_count": int(th_count),
+            "theta_periodic": bool(theta_periodic),
+            "sky_angle_monotonic_until_wrap": True,
+            "semantics": "Given (B radius, sky unit vector) infer lookback unit vector at B by interpolation.",
+        }
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            out_file,
+            metadata_json=np.asarray(json.dumps(meta_out), dtype=object),
+            b_values_rs=np.asarray(b_values, dtype=float),
+            theta_values_deg=np.asarray(th_grid_deg, dtype=float),
+            r_used_rs=np.asarray(-1.0, dtype=float),
+            sky_unit_xy=np.asarray(sky_unit, dtype=float),
+            lookback_unit_xy=np.asarray(look_unit, dtype=float),
+            back_time_s=np.asarray(back_time_s, dtype=float),
+            valid=np.asarray(valid, dtype=bool),
+        )
+        valid_count = int(np.count_nonzero(valid))
+        self.status_var.set(
+            f"sky-table saved: {out_file} | valid={valid_count}/{valid.size} "
+            f"({100.0 * valid_count / max(1, valid.size):.1f}%) | truncated_after_wrap={total_truncated}"
+        )
+
+    @staticmethod
+    def _interpolate_from_theta_endpoints(
+        *,
+        theta_end_deg: np.ndarray,
+        look_dirs: np.ndarray,
+        sky_dirs: np.ndarray,
+        back_times: np.ndarray,
+        query_theta_deg: float,
+    ) -> tuple[bool, np.ndarray, float, np.ndarray]:
+        if theta_end_deg.size == 0:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan"), np.asarray([np.nan, np.nan], dtype=float)
+
+        d = np.abs(np.asarray(theta_end_deg, dtype=float) - float(query_theta_deg))
+        order = np.argsort(d)
+        k = 2 if order.size >= 2 else 1
+        sel = order[:k]
+        eps = 1e-9
+        w = 1.0 / (d[sel] + eps)
+        wsum = float(np.sum(w))
+        if wsum <= 0.0:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan"), np.asarray([np.nan, np.nan], dtype=float)
+        w = w / wsum
+
+        look = np.zeros(2, dtype=float)
+        sky = np.zeros(2, dtype=float)
+        bt = 0.0
+        for ww, ii in zip(w, sel):
+            i = int(ii)
+            look += float(ww) * np.asarray(look_dirs[i], dtype=float)
+            sky += float(ww) * np.asarray(sky_dirs[i], dtype=float)
+            bt += float(ww) * float(back_times[i])
+
+        ln = float(np.hypot(look[0], look[1]))
+        sn = float(np.hypot(sky[0], sky[1]))
+        if ln > 1e-12:
+            look /= ln
+        if sn > 1e-12:
+            sky /= sn
+        ok = bool(np.all(np.isfinite(look)) and np.all(np.isfinite(sky)) and np.isfinite(bt))
+        return ok, look, bt, sky
+
+    @staticmethod
+    def _truncate_sky_row_after_wrap(
+        *,
+        sky_row: np.ndarray,
+        look_row: np.ndarray,
+        bt_row: np.ndarray,
+        valid_row: np.ndarray,
+    ) -> int:
+        idx = np.flatnonzero(np.asarray(valid_row, dtype=bool))
+        if idx.size < 2:
+            return 0
+        sky = np.asarray(sky_row[idx], dtype=float)
+        ang = np.rad2deg(np.arctan2(sky[:, 1], sky[:, 0]))
+        ang = np.mod(ang + 360.0, 360.0)
+
+        cutoff_pos = None
+        prev = float(ang[0])
+        for j in range(1, ang.size):
+            cur = float(ang[j])
+            wrapped = (prev >= 300.0 and cur <= 60.0) or ((prev - cur) > 180.0)
+            non_mono = cur < (prev - 1e-6)
+            if wrapped or non_mono:
+                cutoff_pos = j
+                break
+            prev = cur
+
+        if cutoff_pos is None:
+            return 0
+
+        drop_idx = idx[cutoff_pos:]
+        valid_row[drop_idx] = False
+        sky_row[drop_idx, :] = np.nan
+        look_row[drop_idx, :] = np.nan
+        bt_row[drop_idx] = np.nan
+        return int(drop_idx.size)
+
     def _plot_back_time_heatmap_from_interp(self) -> None:
         interp_file = Path(self.interp_file_path_var.get().strip())
         if not interp_file.exists():
@@ -841,6 +1093,315 @@ class RayTracingGUI:
             f"prop vectors plotted from {interp_file} | requested B={bx_rs:.6g} Rs, "
             f"using B[{bi}]={b_used:.6g} Rs | valid={valid_count}/{total} | res x{vec_res_mult}"
         )
+
+    def _plot_sky_to_look_mapping(self) -> None:
+        sky_file = Path(self.sky_interp_file_path_var.get().strip())
+        if not sky_file.exists():
+            messagebox.showerror("Load Error", f"Sky interpolation file not found:\n{sky_file}")
+            return
+        try:
+            bx_rs = float(self.bx_rs_var.get().strip())
+            th_min = float(self.interp_theta_min_deg_var.get().strip())
+            th_max = float(self.interp_theta_max_deg_var.get().strip())
+            th_count = int(self.interp_theta_count_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Input Error", "B and theta controls must be valid numbers.")
+            return
+        if bx_rs <= 1.0:
+            messagebox.showerror("Input Error", "Observer B x-position must be > 1 Rs.")
+            return
+        if th_count < 2:
+            messagebox.showerror("Input Error", "theta count must be >= 2.")
+            return
+
+        try:
+            data = np.load(sky_file, allow_pickle=True)
+            b_values = np.asarray(data["b_values_rs"], dtype=float)
+            sky_unit = np.asarray(data["sky_unit_xy"], dtype=float)       # [b, th, 2]
+            look_unit = np.asarray(data["lookback_unit_xy"], dtype=float) # [b, th, 2]
+            back_time = np.asarray(data["back_time_s"], dtype=float)      # [b, th]
+            valid = np.asarray(data["valid"], dtype=bool)                 # [b, th]
+            theta_tab = np.asarray(data["theta_values_deg"], dtype=float)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Failed to load sky table:\n{exc}")
+            return
+
+        if b_values.size < 1:
+            messagebox.showerror("Load Error", "Sky table contains no B samples.")
+            return
+        bi = int(np.argmin(np.abs(b_values - bx_rs)))
+        b_used = float(b_values[bi])
+        sky_row = np.asarray(sky_unit[bi], dtype=float)
+        look_row = np.asarray(look_unit[bi], dtype=float)
+        bt_row = np.asarray(back_time[bi], dtype=float)
+        ok_row = np.asarray(valid[bi], dtype=bool)
+
+        theta_q = np.linspace(th_min, th_max, th_count, endpoint=True, dtype=float)
+        sky_q = np.column_stack([np.cos(np.deg2rad(theta_q)), np.sin(np.deg2rad(theta_q))]).astype(float)
+
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        self.ax = ax
+        ax.axhline(0.0, color="#bbbbbb", lw=0.8, alpha=0.7)
+        ax.axvline(0.0, color="#bbbbbb", lw=0.8, alpha=0.7)
+        ax.scatter([0.0], [0.0], s=18, color="black")
+
+        ok_count = 0
+        cmap_vals = np.linspace(0.05, 0.95, theta_q.size)
+        for i in range(theta_q.size):
+            qsky = np.asarray(sky_q[i], dtype=float)
+            ok, qlook, _bt = self._lookup_look_from_sky_vectors(
+                sky_row=sky_row,
+                look_row=look_row,
+                bt_row=bt_row,
+                valid_row=ok_row,
+                qsky=qsky,
+            )
+            if not ok:
+                continue
+            ok_count += 1
+            col = cm.plasma(cmap_vals[i])
+            # Look vector from origin.
+            ax.arrow(
+                0.0,
+                0.0,
+                float(qlook[0]),
+                float(qlook[1]),
+                color=col,
+                width=0.006,
+                head_width=0.07,
+                head_length=0.09,
+                length_includes_head=True,
+                alpha=0.95,
+                zorder=5,
+            )
+            # Sky vector from head of look vector.
+            ax.arrow(
+                float(qlook[0]),
+                float(qlook[1]),
+                float(qsky[0]),
+                float(qsky[1]),
+                color=col,
+                width=0.006,
+                head_width=0.07,
+                head_length=0.09,
+                length_includes_head=True,
+                alpha=0.95,
+                zorder=5,
+            )
+
+        circ_t = np.linspace(0.0, 2.0 * np.pi, 361)
+        ax.plot(np.cos(circ_t), np.sin(circ_t), "k--", lw=0.8, alpha=0.7, label="unit circle")
+        ax.set_aspect("equal", "box")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title(
+            f"Sky->Look Mapping | requested B={bx_rs:.3g} Rs, using table B={b_used:.3g} Rs\n"
+            f"sampled theta=[{th_min:.3g}, {th_max:.3g}] deg, count={th_count}"
+        )
+        ax.grid(alpha=0.2)
+        ax.legend(loc="best")
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+        self.status_var.set(
+            f"sky->look mapping plotted from {sky_file} | requested B={bx_rs:.6g} Rs, "
+            f"using B[{bi}]={b_used:.6g} Rs | valid={ok_count}/{theta_q.size} | "
+            f"table_theta=[{theta_tab[0]:.6g}, {theta_tab[-1]:.6g}]"
+        )
+
+    def _plot_sky_table_pairs(self) -> None:
+        sky_file = Path(self.sky_interp_file_path_var.get().strip())
+        if not sky_file.exists():
+            messagebox.showerror("Load Error", f"Sky interpolation file not found:\n{sky_file}")
+            return
+        try:
+            bx_rs = float(self.bx_rs_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Input Error", "Observer B x-position must be a valid number.")
+            return
+        if bx_rs <= 1.0:
+            messagebox.showerror("Input Error", "Observer B x-position must be > 1 Rs.")
+            return
+
+        try:
+            data = np.load(sky_file, allow_pickle=True)
+            b_values = np.asarray(data["b_values_rs"], dtype=float)
+            sky_unit = np.asarray(data["sky_unit_xy"], dtype=float)
+            look_unit = np.asarray(data["lookback_unit_xy"], dtype=float)
+            valid = np.asarray(data["valid"], dtype=bool)
+            theta_tab = np.asarray(data["theta_values_deg"], dtype=float)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Failed to load sky table:\n{exc}")
+            return
+
+        if b_values.size < 1:
+            messagebox.showerror("Load Error", "Sky table contains no B samples.")
+            return
+        lo_candidates = np.where(b_values <= bx_rs)[0]
+        hi_candidates = np.where(b_values >= bx_rs)[0]
+        lo_idx = int(lo_candidates[-1]) if lo_candidates.size > 0 else 0
+        hi_idx = int(hi_candidates[0]) if hi_candidates.size > 0 else int(b_values.size - 1)
+        idx_list = [lo_idx] if lo_idx == hi_idx else [lo_idx, hi_idx]
+
+        self.fig.clear()
+        axes = self.fig.subplots(len(idx_list), 1, squeeze=False).ravel()
+        self.ax = axes[0]
+
+        # Visual spacing: within-pair tail separation is half of between-pair separation.
+        pair_sep_x = 1.2
+        between_pair_x = 2.4
+        pair_stride = pair_sep_x + between_pair_x
+        pair_order_label = "(look, sky)"
+        th_lo = float(theta_tab[0]) if theta_tab.size else float("nan")
+        th_hi = float(theta_tab[-1]) if theta_tab.size else float("nan")
+        plotted_counts: list[int] = []
+        plotted_b: list[float] = []
+
+        for ax, bi in zip(axes, idx_list):
+            b_used = float(b_values[bi])
+            sky_row = np.asarray(sky_unit[bi], dtype=float)
+            look_row = np.asarray(look_unit[bi], dtype=float)
+            ok_row = np.asarray(valid[bi], dtype=bool)
+            valid_idx = np.flatnonzero(ok_row)
+            plotted_counts.append(int(valid_idx.size))
+            plotted_b.append(b_used)
+
+            ax.axhline(0.0, color="#bbbbbb", lw=0.8, alpha=0.8)
+            if valid_idx.size > 0:
+                cmap_vals = np.linspace(0.05, 0.95, valid_idx.size)
+                for pi, idx in enumerate(valid_idx):
+                    x0 = float(pi) * pair_stride
+                    look = np.asarray(look_row[int(idx)], dtype=float)
+                    sky = np.asarray(sky_row[int(idx)], dtype=float)
+                    col = cm.plasma(cmap_vals[pi])
+
+                    ax.arrow(
+                        x0,
+                        0.0,
+                        float(look[0]),
+                        float(look[1]),
+                        color=col,
+                        width=0.012,
+                        head_width=0.12,
+                        head_length=0.14,
+                        length_includes_head=True,
+                        alpha=0.95,
+                        zorder=5,
+                    )
+                    ax.arrow(
+                        x0 + pair_sep_x,
+                        0.0,
+                        float(sky[0]),
+                        float(sky[1]),
+                        color=col,
+                        width=0.012,
+                        head_width=0.12,
+                        head_length=0.14,
+                        length_includes_head=True,
+                        alpha=0.95,
+                        zorder=5,
+                    )
+                    ax.plot([x0, x0 + pair_sep_x], [0.0, 0.0], color="#999999", lw=0.5, alpha=0.6)
+
+                # Black separators between neighboring pairs.
+                for pi in range(valid_idx.size - 1):
+                    x_pair0 = float(pi) * pair_stride
+                    x_pair1 = float(pi + 1) * pair_stride
+                    x_sep = 0.5 * ((x_pair0 + pair_sep_x) + x_pair1)
+                    ax.axvline(x_sep, color="black", lw=0.9, alpha=0.9, zorder=1)
+
+                x_max = float((valid_idx.size - 1) * pair_stride + pair_sep_x + 1.3)
+                ax.set_xlim(-0.7, x_max)
+            else:
+                ax.set_xlim(-0.7, 2.3)
+
+            ax.set_ylim(-1.4, 1.4)
+            ax.set_aspect("equal", "box")
+            ax.set_ylabel("vector y")
+            ax.set_title(
+                f"B row: {b_used:.3g} Rs ({'<= query' if b_used <= bx_rs else '>= query'}) {pair_order_label} | "
+                f"valid pairs={valid_idx.size}"
+            )
+            ax.grid(alpha=0.2)
+
+        axes[-1].set_xlabel("table order (pair tails separated by +1 x)")
+        self.fig.suptitle(
+            f"Sky Table Pairs {pair_order_label} | requested B={bx_rs:.3g} Rs | theta=[{th_lo:.3g}, {th_hi:.3g}] deg",
+            y=0.995,
+        )
+        self.fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+        self.canvas.draw_idle()
+
+        if len(idx_list) == 1:
+            self.status_var.set(
+                f"sky table pairs plotted from {sky_file} | requested B={bx_rs:.6g} Rs | "
+                f"using exact/only B[{idx_list[0]}]={plotted_b[0]:.6g} Rs | valid pairs={plotted_counts[0]}"
+            )
+        else:
+            self.status_var.set(
+                f"sky table pairs plotted from {sky_file} | requested B={bx_rs:.6g} Rs | "
+                f"B<= uses [{idx_list[0]}]={plotted_b[0]:.6g} (pairs={plotted_counts[0]}), "
+                f"B>= uses [{idx_list[1]}]={plotted_b[1]:.6g} (pairs={plotted_counts[1]})"
+            )
+
+    @staticmethod
+    def _lookup_look_from_sky_vectors(
+        *,
+        sky_row: np.ndarray,
+        look_row: np.ndarray,
+        bt_row: np.ndarray,
+        valid_row: np.ndarray,
+        qsky: np.ndarray,
+    ) -> tuple[bool, np.ndarray, float]:
+        ok = np.asarray(valid_row, dtype=bool)
+        if np.count_nonzero(ok) == 0:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+
+        s = np.asarray(sky_row[ok], dtype=float)
+        l = np.asarray(look_row[ok], dtype=float)
+        t = np.asarray(bt_row[ok], dtype=float)
+        q = np.asarray(qsky, dtype=float)
+        nq = float(np.hypot(q[0], q[1]))
+        if nq <= 1e-12:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+        q = q / nq
+
+        # Enforce interpolation domain: query sky direction must lie within
+        # the valid angular span in this row (no extrapolation outside table range).
+        s_ang = np.mod(np.rad2deg(np.arctan2(s[:, 1], s[:, 0])) + 360.0, 360.0)
+        q_ang = float(np.mod(np.rad2deg(np.arctan2(q[1], q[0])) + 360.0, 360.0))
+        sort_idx = np.argsort(s_ang)
+        s_ang = s_ang[sort_idx]
+        s = s[sort_idx]
+        l = l[sort_idx]
+        t = t[sort_idx]
+        eps_deg = 1e-6
+        if q_ang < float(s_ang[0]) - eps_deg or q_ang > float(s_ang[-1]) + eps_deg:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+
+        d = np.abs(s_ang - q_ang)
+        order = np.argsort(d)
+        k = 2 if order.size >= 2 else 1
+        sel = order[:k]
+        eps = 1e-9
+        w = 1.0 / (d[sel] + eps)
+        wsum = float(np.sum(w))
+        if wsum <= 0.0:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+        w /= wsum
+
+        look = np.zeros(2, dtype=float)
+        bt = 0.0
+        for ww, ii in zip(w, sel):
+            i = int(ii)
+            look += float(ww) * l[i]
+            bt += float(ww) * float(t[i])
+        nlook = float(np.hypot(look[0], look[1]))
+        if nlook > 1e-12:
+            look /= nlook
+        ok_out = bool(np.all(np.isfinite(look)) and np.isfinite(bt))
+        return ok_out, look, bt
 
     @staticmethod
     def _resample_masked_grid(

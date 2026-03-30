@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -8,26 +9,6 @@ import numpy as np
 
 from earliest_visible_interpolated_session import SampledTrajectory3D
 from inertial_objects import InertialTetrahedron
-from precompute_earliest_grid import PrecomputedEarliestInterpolator
-
-TESTS_DIR = Path(__file__).resolve().parent / "tests"
-if str(TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTS_DIR))
-import plot_visibility_from_initial_states as pvis
-
-
-def _resolve_precompute_path(path: Path) -> Path:
-    if path.exists():
-        return path
-    fallbacks = [
-        Path("data") / "earliest_angles_precompute_10rs.npz",
-        Path("earliest_angles_precompute_10rs.npz"),
-        Path("tests") / "earliest_angles_precompute_10rs.npz",
-    ]
-    found = next((p for p in fallbacks if p.exists()), None)
-    if found is None:
-        raise FileNotFoundError(f"Could not find precompute file at {path} or fallback locations.")
-    return found
 
 
 def _resolve_sky_vertices_path(path: Path) -> Optional[Path]:
@@ -40,12 +21,24 @@ def _resolve_sky_vertices_path(path: Path) -> Optional[Path]:
     return next((p for p in fallbacks if p.exists()), None)
 
 
-def _resolve_sky_interp_path(path: Path) -> Optional[Path]:
+def _resolve_ray_local_interp_path(path: Path) -> Optional[Path]:
     if path.exists():
         return path
     fallbacks = [
-        Path("data") / "earliest_angles_sky_100rs_fixed_ar_two_family_solver.npz",
-        Path("earliest_angles_sky_100rs_fixed_ar_two_family_solver.npz"),
+        Path("ray_tracing") / "multi_sequences_interp_table.npz",
+        Path("data") / "multi_sequences_interp_table.npz",
+        Path("multi_sequences_interp_table.npz"),
+    ]
+    return next((p for p in fallbacks if p.exists()), None)
+
+
+def _resolve_ray_sky_interp_path(path: Path) -> Optional[Path]:
+    if path.exists():
+        return path
+    fallbacks = [
+        Path("ray_tracing") / "sky_interp_table.npz",
+        Path("data") / "sky_interp_table.npz",
+        Path("sky_interp_table.npz"),
     ]
     return next((p for p in fallbacks if p.exists()), None)
 
@@ -99,9 +92,9 @@ def _expand_faces_with_seam_fix(points: np.ndarray, faces: np.ndarray, uv: np.nd
 class InertialViewerPyVista:
     def __init__(
         self,
-        precompute_npz: Path,
+        ray_local_interp_npz: Optional[Path],
+        ray_sky_interp_npz: Optional[Path],
         sky_vertices_npz: Optional[Path],
-        sky_interp_npz: Optional[Path],
         sky_image_path: Optional[Path],
     ) -> None:
         try:
@@ -115,11 +108,38 @@ class InertialViewerPyVista:
         self.QtWidgets = QtWidgets
         self.QtInteractor = QtInteractor
         self.pv = pv
+        self.rs = 1.0
+        self.ray_local_enabled = False
+        self.ray_sky_enabled = False
+        self.ray_local_status = "ray local: disabled"
+        self.ray_sky_status = "ray sky: disabled"
+        self.ray_local_meta = {}
+        self.ray_sky_meta = {}
+        self.ray_local_b = np.zeros((0,), dtype=float)
+        self.ray_local_r = np.zeros((0,), dtype=float)
+        self.ray_local_th = np.zeros((0,), dtype=float)
+        self.ray_local_look = np.zeros((0, 0, 0, 2), dtype=float)
+        self.ray_local_dt = np.zeros((0, 0, 0), dtype=float)
+        self.ray_local_valid = np.zeros((0, 0, 0), dtype=bool)
+        self.ray_sky_b = np.zeros((0,), dtype=float)
+        self.ray_sky_sky = np.zeros((0, 0, 2), dtype=float)
+        self.ray_sky_look = np.zeros((0, 0, 2), dtype=float)
+        self.ray_sky_dt = np.zeros((0, 0), dtype=float)
+        self.ray_sky_valid = np.zeros((0, 0), dtype=bool)
+        self._sky_cache = None
 
-        self.interp = PrecomputedEarliestInterpolator.from_npz(precompute_npz)
-        self.interp.prepare_backend(use_gpu=False)
-        self.sky_interp = self.interp
-        self.rs = float(self.interp.rs_m)
+        self._load_ray_tracing_tables(ray_local_interp_npz, ray_sky_interp_npz)
+        if not self.ray_local_enabled or not self.ray_sky_enabled:
+            raise RuntimeError("Ray-tracing local/sky interpolation tables are required. Build them in ray_tracing GUI first.")
+
+        rs_guess = None
+        src_local = self.ray_local_meta.get("source_metadata", {}) if isinstance(self.ray_local_meta, dict) else {}
+        src_sky = self.ray_sky_meta.get("source_metadata", {}) if isinstance(self.ray_sky_meta, dict) else {}
+        if isinstance(src_local, dict) and "rs_m" in src_local:
+            rs_guess = float(src_local["rs_m"])
+        elif isinstance(src_sky, dict) and "rs_m" in src_sky:
+            rs_guess = float(src_sky["rs_m"])
+        self.rs = float(rs_guess) if (rs_guess is not None and np.isfinite(rs_guess) and rs_guess > 0.0) else 1.0
 
         traj = _build_center_trajectory(tmin=-200.0, tmax=320.0, samples=4097, radius_m=5.0 * self.rs)
         self.tetra = InertialTetrahedron(
@@ -128,10 +148,6 @@ class InertialViewerPyVista:
             rotation_angles_deg=(15.0, 25.0, 10.0),
         )
         self.corner_traj, self.face_traj = self._build_tetra_point_trajectories()
-        self.prev_corner_batch = None
-        self.prev_face_batch = None
-        self.prev_corner_t0: Optional[float] = None
-        self.prev_face_t0: Optional[float] = None
 
         self.observer_b = np.asarray([9.0 * self.rs, 0.0, 0.0], dtype=float)
         self.t = 0.0
@@ -143,7 +159,7 @@ class InertialViewerPyVista:
         self.sky_uv = np.zeros((0, 2), dtype=np.float32)
         self.sky_status = "sky: disabled"
         self.sky_texture = None
-        self._load_sky_data(sky_vertices_npz, sky_interp_npz, sky_image_path)
+        self._load_sky_data(sky_vertices_npz, sky_image_path)
 
         self.app = self.QtWidgets.QApplication.instance() or self.QtWidgets.QApplication(sys.argv)
         self.window = self.QtWidgets.QMainWindow()
@@ -186,10 +202,6 @@ class InertialViewerPyVista:
         self.spin_speed.setSingleStep(0.1)
         panel_layout.addWidget(self.spin_speed)
 
-        self.chk_gpu = self.QtWidgets.QCheckBox("Use GPU interpolation")
-        self.chk_gpu.setChecked(False)
-        panel_layout.addWidget(self.chk_gpu)
-
         self.chk_sky_both = self.QtWidgets.QCheckBox("Sky: show + and -")
         self.chk_sky_both.setChecked(True)
         self.chk_sky_both.stateChanged.connect(self._draw_frame)
@@ -203,6 +215,8 @@ class InertialViewerPyVista:
         panel_layout.addWidget(self.lbl_status)
         self.lbl_sky = self.QtWidgets.QLabel(self.sky_status)
         panel_layout.addWidget(self.lbl_sky)
+        self.lbl_ray = self.QtWidgets.QLabel(f"{self.ray_local_status} | {self.ray_sky_status}")
+        panel_layout.addWidget(self.lbl_ray)
         panel_layout.addStretch(1)
 
         self.timer = self.QtCore.QTimer()
@@ -221,14 +235,63 @@ class InertialViewerPyVista:
         face_traj = [_offset_trajectory(base, off) for off in face_offsets]
         return corner_traj, face_traj
 
+    def _load_ray_tracing_tables(self, local_npz: Optional[Path], sky_npz: Optional[Path]) -> None:
+        self.ray_local_enabled = False
+        self.ray_sky_enabled = False
+        self.ray_local_status = "ray local: missing"
+        self.ray_sky_status = "ray sky: missing"
+        if local_npz is not None and local_npz.exists():
+            try:
+                data = np.load(local_npz, allow_pickle=True)
+                self.ray_local_b = np.asarray(data["b_values_rs"], dtype=float)
+                self.ray_local_r = np.asarray(data["r_values_rs"], dtype=float)
+                self.ray_local_th = np.asarray(data["theta_values_deg"], dtype=float)
+                self.ray_local_look = np.asarray(data["lookback_unit_xy"], dtype=float)
+                self.ray_local_dt = np.asarray(data["back_time_s"], dtype=float)
+                self.ray_local_valid = np.asarray(data["valid"], dtype=bool)
+                meta_raw = data.get("metadata_json", np.asarray("", dtype=object))
+                self.ray_local_meta = json.loads(str(meta_raw.item())) if np.size(meta_raw) > 0 else {}
+                self.ray_local_enabled = (
+                    self.ray_local_b.size > 0
+                    and self.ray_local_r.size > 0
+                    and self.ray_local_th.size > 0
+                    and self.ray_local_look.ndim == 4
+                    and self.ray_local_dt.ndim == 3
+                    and self.ray_local_valid.ndim == 3
+                )
+                self.ray_local_status = f"ray local: loaded ({self.ray_local_b.size} B rows)"
+            except Exception:
+                self.ray_local_enabled = False
+                self.ray_local_status = "ray local: load failed"
+        if sky_npz is not None and sky_npz.exists():
+            try:
+                data = np.load(sky_npz, allow_pickle=True)
+                self.ray_sky_b = np.asarray(data["b_values_rs"], dtype=float)
+                self.ray_sky_sky = np.asarray(data["sky_unit_xy"], dtype=float)
+                self.ray_sky_look = np.asarray(data["lookback_unit_xy"], dtype=float)
+                self.ray_sky_dt = np.asarray(data["back_time_s"], dtype=float)
+                self.ray_sky_valid = np.asarray(data["valid"], dtype=bool)
+                meta_raw = data.get("metadata_json", np.asarray("", dtype=object))
+                self.ray_sky_meta = json.loads(str(meta_raw.item())) if np.size(meta_raw) > 0 else {}
+                self.ray_sky_enabled = (
+                    self.ray_sky_b.size > 0
+                    and self.ray_sky_sky.ndim == 3
+                    and self.ray_sky_look.ndim == 3
+                    and self.ray_sky_dt.ndim == 2
+                    and self.ray_sky_valid.ndim == 2
+                )
+                self.ray_sky_status = f"ray sky: loaded ({self.ray_sky_b.size} B rows)"
+            except Exception:
+                self.ray_sky_enabled = False
+                self.ray_sky_status = "ray sky: load failed"
+
     def _load_sky_data(
         self,
         sky_vertices_npz: Optional[Path],
-        sky_interp_npz: Optional[Path],
         sky_image_path: Optional[Path],
     ) -> None:
         if sky_vertices_npz is None or not sky_vertices_npz.exists():
-            self.sky_status = "sky: precompute missing"
+            self.sky_status = "sky: mesh missing"
             return
         try:
             data = np.load(sky_vertices_npz, allow_pickle=False)
@@ -238,23 +301,11 @@ class InertialViewerPyVista:
                 self.sky_radius_m = float(np.nanmedian(np.linalg.norm(self.sky_vertices, axis=1)))
             self.sky_uv = np.asarray(data["uv"], dtype=np.float32)
         except Exception:
-            self.sky_status = "sky: precompute load failed"
+            self.sky_status = "sky: mesh load failed"
             return
 
-        if sky_interp_npz is not None and sky_interp_npz.exists():
-            try:
-                self.sky_interp = PrecomputedEarliestInterpolator.from_npz(sky_interp_npz)
-                self.sky_interp.prepare_backend(use_gpu=False)
-            except Exception:
-                self.sky_interp = self.interp
-                self.sky_status = "sky: interp table load failed (fallback to main table)"
-        else:
-            self.sky_interp = self.interp
-            self.sky_status = "sky: interp table missing (fallback to main table)"
-
         if sky_image_path is None or not sky_image_path.exists():
-            if "fallback" not in self.sky_status:
-                self.sky_status = "sky: image missing"
+            self.sky_status = "sky: image missing"
             return
         try:
             self.sky_texture = self.pv.read_texture(str(sky_image_path))
@@ -263,13 +314,253 @@ class InertialViewerPyVista:
             except Exception:
                 pass
         except Exception:
-            if "fallback" not in self.sky_status:
-                self.sky_status = "sky: image load failed"
+            self.sky_status = "sky: image load failed"
             return
-        if "fallback" in self.sky_status:
-            self.sky_status = f"sky: loaded texture/mesh ({self.sky_faces.shape[0]} tris), {self.sky_status}"
+        self.sky_status = f"sky: loaded ({self.sky_faces.shape[0]} tris, ray-table mapping)"
+
+    @staticmethod
+    def _normalize_xy(v: np.ndarray) -> np.ndarray:
+        arr = np.asarray(v, dtype=float)
+        n = np.linalg.norm(arr, axis=-1, keepdims=True)
+        return np.where(n > 1e-12, arr / np.maximum(n, 1e-12), np.nan)
+
+    @staticmethod
+    def _nearest_b_rows(b_values: np.ndarray, b_query: float) -> tuple[int, int, float]:
+        b = np.asarray(b_values, dtype=float)
+        if b.size == 1:
+            return 0, 0, 0.0
+        if b_query <= float(b[0]):
+            return 0, 0, 0.0
+        if b_query >= float(b[-1]):
+            n = int(b.size - 1)
+            return n, n, 0.0
+        hi = int(np.searchsorted(b, b_query, side="left"))
+        lo = max(0, hi - 1)
+        b0 = float(b[lo])
+        b1 = float(b[hi])
+        wb = 0.0 if abs(b1 - b0) <= 1e-12 else (float(b_query) - b0) / (b1 - b0)
+        return lo, hi, float(np.clip(wb, 0.0, 1.0))
+
+    def _lookup_local_row(self, bi: int, x_rs: float, y_rs: float) -> tuple[bool, np.ndarray, float]:
+        r = float(np.hypot(x_rs, y_rs))
+        th = float(np.rad2deg(np.arctan2(y_rs, x_rs)))
+        if th < 0.0:
+            th += 360.0
+
+        r_grid = np.asarray(self.ray_local_r, dtype=float)
+        th_grid = np.asarray(self.ray_local_th, dtype=float)
+        if r_grid.size < 1 or th_grid.size < 1:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+        if r < float(r_grid[0]) or r > float(r_grid[-1]) or th < float(th_grid[0]) or th > float(th_grid[-1]):
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+
+        ir1 = int(np.searchsorted(r_grid, r, side="left"))
+        it1 = int(np.searchsorted(th_grid, th, side="left"))
+        ir0 = max(0, ir1 - 1)
+        it0 = max(0, it1 - 1)
+        ir1 = min(ir1, int(r_grid.size - 1))
+        it1 = min(it1, int(th_grid.size - 1))
+
+        r0 = float(r_grid[ir0]); r1 = float(r_grid[ir1])
+        t0 = float(th_grid[it0]); t1 = float(th_grid[it1])
+        wr = 0.0 if abs(r1 - r0) <= 1e-12 else (r - r0) / (r1 - r0)
+        wt = 0.0 if abs(t1 - t0) <= 1e-12 else (th - t0) / (t1 - t0)
+        wr = float(np.clip(wr, 0.0, 1.0)); wt = float(np.clip(wt, 0.0, 1.0))
+
+        corners = [
+            (ir0, it0, (1.0 - wr) * (1.0 - wt)),
+            (ir1, it0, wr * (1.0 - wt)),
+            (ir0, it1, (1.0 - wr) * wt),
+            (ir1, it1, wr * wt),
+        ]
+        look = np.zeros(2, dtype=float)
+        bt = 0.0
+        wsum = 0.0
+        for ii, jj, ww in corners:
+            if ww <= 0.0:
+                continue
+            if not bool(self.ray_local_valid[bi, ii, jj]):
+                continue
+            lv = np.asarray(self.ray_local_look[bi, ii, jj, :], dtype=float)
+            tv = float(self.ray_local_dt[bi, ii, jj])
+            if not np.all(np.isfinite(lv)) or not np.isfinite(tv):
+                continue
+            look += ww * lv
+            bt += ww * tv
+            wsum += ww
+        if wsum <= 1e-12:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+        look /= wsum
+        bt /= wsum
+        n = float(np.hypot(look[0], look[1]))
+        if n <= 1e-12:
+            return False, np.asarray([np.nan, np.nan], dtype=float), float("nan")
+        look /= n
+        return bool(np.all(np.isfinite(look)) and np.isfinite(bt)), look, float(bt)
+
+    def _lookup_local_two_family(self, points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        p = np.asarray(points_xyz, dtype=float)
+        n = int(p.shape[0])
+        arr_p = np.full((n, 3), np.nan, dtype=float)
+        arr_m = np.full((n, 3), np.nan, dtype=float)
+        dt_p = np.full((n,), np.nan, dtype=float)
+        dt_m = np.full((n,), np.nan, dtype=float)
+        ok_p = np.zeros((n,), dtype=bool)
+        ok_m = np.zeros((n,), dtype=bool)
+        if not self.ray_local_enabled or n == 0:
+            return arr_p, arr_m, dt_p, dt_m, ok_p, ok_m
+
+        b_query = float(np.hypot(self.observer_b[0], self.observer_b[1]) / max(self.rs, 1e-12))
+        b0, b1, wb = self._nearest_b_rows(self.ray_local_b, b_query)
+
+        def lookup_blend(x_rs: float, y_rs: float) -> tuple[bool, np.ndarray, float]:
+            ok0, l0, t0 = self._lookup_local_row(b0, x_rs, y_rs)
+            if b1 == b0:
+                return ok0, l0, t0
+            ok1, l1, t1 = self._lookup_local_row(b1, x_rs, y_rs)
+            if ok0 and ok1:
+                l = (1.0 - wb) * l0 + wb * l1
+                nrm = float(np.hypot(l[0], l[1]))
+                if nrm > 1e-12:
+                    l = l / nrm
+                return True, l, float((1.0 - wb) * t0 + wb * t1)
+            if ok0:
+                return ok0, l0, t0
+            return ok1, l1, t1
+
+        for i in range(n):
+            x_rs = float(p[i, 0] / max(self.rs, 1e-12))
+            y_rs = float(p[i, 1] / max(self.rs, 1e-12))
+            ok, look, bt = lookup_blend(x_rs, y_rs)
+            if ok:
+                arr_p[i, :2] = -look
+                arr_p[i, 2] = 0.0
+                dt_p[i] = bt
+                ok_p[i] = True
+
+            # Mirrored family: flip input across x-axis, evaluate, then flip output back.
+            okf, lookf, btf = lookup_blend(x_rs, -y_rs)
+            if okf:
+                look_m = np.asarray([lookf[0], -lookf[1]], dtype=float)
+                arr_m[i, :2] = -look_m
+                arr_m[i, 2] = 0.0
+                dt_m[i] = btf
+                ok_m[i] = True
+        return arr_p, arr_m, dt_p, dt_m, ok_p, ok_m
+
+    def _lookup_sky_two_family(self, sky_query_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        q = self._normalize_xy(np.asarray(sky_query_xy, dtype=float))
+        n = int(q.shape[0])
+        arr_p = np.full((n, 3), np.nan, dtype=float)
+        arr_m = np.full((n, 3), np.nan, dtype=float)
+        dt_p = np.full((n,), np.nan, dtype=float)
+        dt_m = np.full((n,), np.nan, dtype=float)
+        ok_p = np.zeros((n,), dtype=bool)
+        ok_m = np.zeros((n,), dtype=bool)
+        if not self.ray_sky_enabled or n == 0:
+            return arr_p, arr_m, dt_p, dt_m, ok_p, ok_m
+
+        b_query = float(np.hypot(self.observer_b[0], self.observer_b[1]) / max(self.rs, 1e-12))
+        b0, b1, wb = self._nearest_b_rows(self.ray_sky_b, b_query)
+
+        def solve_row(bi: int, qxy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            ok = np.asarray(self.ray_sky_valid[bi], dtype=bool)
+            s = np.asarray(self.ray_sky_sky[bi], dtype=float)[ok]
+            l = np.asarray(self.ray_sky_look[bi], dtype=float)[ok]
+            t = np.asarray(self.ray_sky_dt[bi], dtype=float)[ok]
+            out_ok = np.zeros((qxy.shape[0],), dtype=bool)
+            out_l = np.full((qxy.shape[0], 2), np.nan, dtype=float)
+            out_t = np.full((qxy.shape[0],), np.nan, dtype=float)
+            if s.shape[0] < 1:
+                return out_ok, out_l, out_t
+
+            sang = np.mod(np.rad2deg(np.arctan2(s[:, 1], s[:, 0])) + 360.0, 360.0)
+            order = np.argsort(sang)
+            sang = sang[order]; s = s[order]; l = l[order]; t = t[order]
+            qang = np.mod(np.rad2deg(np.arctan2(qxy[:, 1], qxy[:, 0])) + 360.0, 360.0)
+            in_rng = (qang >= float(sang[0]) - 1e-6) & (qang <= float(sang[-1]) + 1e-6)
+            idx = np.where(in_rng)[0]
+            if idx.size == 0:
+                return out_ok, out_l, out_t
+            qq = qang[idx]
+            hi = np.searchsorted(sang, qq, side="left")
+            hi = np.clip(hi, 0, sang.size - 1)
+            lo = np.clip(hi - 1, 0, sang.size - 1)
+            d0 = np.abs(qq - sang[lo])
+            d1 = np.abs(sang[hi] - qq)
+            same = (lo == hi)
+            w0 = np.where(same, 1.0, 1.0 / np.maximum(d0, 1e-9))
+            w1 = np.where(same, 0.0, 1.0 / np.maximum(d1, 1e-9))
+            wsum = np.maximum(w0 + w1, 1e-12)
+            w0 /= wsum; w1 /= wsum
+            lv = w0[:, None] * l[lo] + w1[:, None] * l[hi]
+            nv = np.linalg.norm(lv, axis=1, keepdims=True)
+            lv = np.where(nv > 1e-12, lv / np.maximum(nv, 1e-12), np.nan)
+            tv = w0 * t[lo] + w1 * t[hi]
+            good = np.all(np.isfinite(lv), axis=1) & np.isfinite(tv)
+            out_ok[idx] = good
+            out_l[idx] = lv
+            out_t[idx] = tv
+            return out_ok, out_l, out_t
+
+        # Plus family.
+        ok0, l0, t0 = solve_row(b0, q)
+        if b1 == b0:
+            ok_p = ok0
+            look_p = l0
+            dt_p = t0
         else:
-            self.sky_status = f"sky: loaded ({self.sky_faces.shape[0]} tris, fixed-radius interp)"
+            ok1, l1, t1 = solve_row(b1, q)
+            both = ok0 & ok1
+            only0 = ok0 & (~ok1)
+            only1 = ok1 & (~ok0)
+            look_p = np.full_like(l0, np.nan)
+            dtp = np.full_like(t0, np.nan)
+            if np.any(both):
+                mix = (1.0 - wb) * l0[both] + wb * l1[both]
+                nrm = np.linalg.norm(mix, axis=1, keepdims=True)
+                mix = np.where(nrm > 1e-12, mix / np.maximum(nrm, 1e-12), np.nan)
+                look_p[both] = mix
+                dtp[both] = (1.0 - wb) * t0[both] + wb * t1[both]
+            look_p[only0] = l0[only0]; dtp[only0] = t0[only0]
+            look_p[only1] = l1[only1]; dtp[only1] = t1[only1]
+            ok_p = both | only0 | only1
+            dt_p = dtp
+        arr_p[:, :2] = -look_p
+        arr_p[:, 2] = 0.0
+        arr_p[~ok_p] = np.nan
+
+        # Mirrored family from flipped input, then flip output back.
+        qf = np.asarray(q, dtype=float)
+        qf[:, 1] *= -1.0
+        ok0, l0, t0 = solve_row(b0, qf)
+        if b1 == b0:
+            okm = ok0
+            look_m = l0
+            dtm = t0
+        else:
+            ok1, l1, t1 = solve_row(b1, qf)
+            both = ok0 & ok1
+            only0 = ok0 & (~ok1)
+            only1 = ok1 & (~ok0)
+            look_m = np.full_like(l0, np.nan)
+            dtm = np.full_like(t0, np.nan)
+            if np.any(both):
+                mix = (1.0 - wb) * l0[both] + wb * l1[both]
+                nrm = np.linalg.norm(mix, axis=1, keepdims=True)
+                mix = np.where(nrm > 1e-12, mix / np.maximum(nrm, 1e-12), np.nan)
+                look_m[both] = mix
+                dtm[both] = (1.0 - wb) * t0[both] + wb * t1[both]
+            look_m[only0] = l0[only0]; dtm[only0] = t0[only0]
+            look_m[only1] = l1[only1]; dtm[only1] = t1[only1]
+            okm = both | only0 | only1
+        look_m[:, 1] *= -1.0
+        ok_m = okm
+        dt_m = dtm
+        arr_m[:, :2] = -look_m
+        arr_m[:, 2] = 0.0
+        arr_m[~ok_m] = np.nan
+        return arr_p, arr_m, dt_p, dt_m, ok_p, ok_m
 
     def _compute_sky_visibility_interp(self):
         if self.sky_vertices.size == 0:
@@ -278,21 +569,19 @@ class InertialViewerPyVista:
             z1 = np.full((n_v,), np.nan, dtype=float)
             zb = np.zeros((n_v,), dtype=bool)
             return z3, z3, z1, z1, zb, zb
-
-        b_all = np.repeat(self.observer_b.reshape(1, 3), self.sky_vertices.shape[0], axis=0)
-        out = self.sky_interp.interpolate_pairs_3d(
-            a_points_m=self.sky_vertices,
-            b_points_m=b_all,
-            use_gpu=bool(self.chk_gpu.isChecked()),
-            batch_size=5000,
+        cache_key = (
+            float(self.observer_b[0]),
+            float(self.observer_b[1]),
+            float(self.observer_b[2]),
+            int(self.sky_vertices.shape[0]),
         )
-        ap = np.asarray(out["arrival_dir_plus_xyz"], dtype=float)
-        am = np.asarray(out["arrival_dir_minus_xyz"], dtype=float)
-        dp = np.asarray(out["delta_t_plus_s"], dtype=float)
-        dm = np.asarray(out["delta_t_minus_s"], dtype=float)
-        op = np.asarray(out["ok_plus"], dtype=bool) & np.all(np.isfinite(ap), axis=1)
-        om = np.asarray(out["ok_minus"], dtype=bool) & np.all(np.isfinite(am), axis=1)
-        return ap, am, dp, dm, op, om
+        if isinstance(self._sky_cache, tuple) and len(self._sky_cache) == 2 and self._sky_cache[0] == cache_key:
+            return self._sky_cache[1]
+        to_sky = np.asarray(self.sky_vertices, dtype=float) - self.observer_b.reshape(1, 3)
+        qxy = self._normalize_xy(to_sky[:, :2])
+        out = self._lookup_sky_two_family(qxy)
+        self._sky_cache = (cache_key, out)
+        return out
 
     def _setup_scene(self) -> None:
         self.plotter.set_background("black")
@@ -342,10 +631,6 @@ class InertialViewerPyVista:
 
     def _reset(self) -> None:
         self.t = 0.0
-        self.prev_corner_batch = None
-        self.prev_face_batch = None
-        self.prev_corner_t0 = None
-        self.prev_face_t0 = None
         self._draw_frame()
 
     def _orient_sky_look_dirs(self, arr_dirs: np.ndarray, source_points: np.ndarray) -> np.ndarray:
@@ -421,48 +706,98 @@ class InertialViewerPyVista:
         face_cells = np.hstack([np.full((faces.shape[0], 1), 3, dtype=np.int32), faces]).ravel()
         return self.pv.PolyData(pts.astype(np.float32), face_cells.astype(np.int32))
 
+    def _solve_local_branch_for_trajectory(
+        self,
+        sampled: SampledTrajectory3D,
+        t0: float,
+        side: str,
+        tmin: float,
+        tmax: float,
+        scan_samples: int,
+    ) -> Optional[dict]:
+        t_hi = min(float(tmax), float(t0))
+        t_lo = float(tmin)
+        if t_hi <= t_lo:
+            return None
+        ts = np.linspace(t_lo, t_hi, max(3, int(scan_samples)), dtype=float)
+        pts = sampled.eval_points(ts)
+        ap, am, dp, dm, op, om = self._lookup_local_two_family(pts)
+        if side == "plus":
+            ok = op
+            dt = dp
+            arr = ap
+        else:
+            ok = om
+            dt = dm
+            arr = am
+        ok = np.asarray(ok, dtype=bool) & np.isfinite(dt)
+        if np.count_nonzero(ok) < 2:
+            return None
+        f = ts + dt - float(t0)
+        idx = np.where(ok[:-1] & ok[1:])[0]
+        roots = []
+        for i in idx:
+            f0 = float(f[i]); f1 = float(f[i + 1])
+            if (f0 == 0.0) or (f1 == 0.0) or (f0 * f1 <= 0.0):
+                denom = (f1 - f0)
+                if abs(denom) <= 1e-12:
+                    te = float(ts[i])
+                else:
+                    te = float(ts[i] - f0 * (ts[i + 1] - ts[i]) / denom)
+                roots.append(float(np.clip(te, ts[i], ts[i + 1])))
+        if roots:
+            te = float(min(roots))
+        else:
+            cand = np.where(ok)[0]
+            if cand.size == 0:
+                return None
+            te = float(ts[int(cand[np.argmin(np.abs(f[cand]))])])
+        p = sampled.eval_points(np.asarray([te], dtype=float))[0:1]
+        ap1, am1, dp1, dm1, op1, om1 = self._lookup_local_two_family(p)
+        if side == "plus":
+            if not bool(op1[0]) or (not np.isfinite(dp1[0])) or (not np.all(np.isfinite(ap1[0]))):
+                return None
+            return {
+                "emission_time_s": float(te),
+                "delta_t_s": float(dp1[0]),
+                "arrival_dir_xyz": tuple(float(v) for v in ap1[0].tolist()),
+                "point_a_xyz": tuple(float(v) for v in p[0].tolist()),
+            }
+        if not bool(om1[0]) or (not np.isfinite(dm1[0])) or (not np.all(np.isfinite(am1[0]))):
+            return None
+        return {
+            "emission_time_s": float(te),
+            "delta_t_s": float(dm1[0]),
+            "arrival_dir_xyz": tuple(float(v) for v in am1[0].tolist()),
+            "point_a_xyz": tuple(float(v) for v in p[0].tolist()),
+        }
+
+    def _solve_local_batch_for_t0(self, sampled_trajectories: list[SampledTrajectory3D], t0: float, tmin: float, tmax: float, scan_samples: int) -> list[dict]:
+        out = []
+        for sampled in sampled_trajectories:
+            plus = self._solve_local_branch_for_trajectory(sampled, t0=t0, side="plus", tmin=tmin, tmax=tmax, scan_samples=scan_samples)
+            minus = self._solve_local_branch_for_trajectory(sampled, t0=t0, side="minus", tmin=tmin, tmax=tmax, scan_samples=scan_samples)
+            earliest = None
+            if isinstance(plus, dict) and isinstance(minus, dict):
+                earliest = plus if float(plus["emission_time_s"]) <= float(minus["emission_time_s"]) else minus
+            elif isinstance(plus, dict):
+                earliest = plus
+            elif isinstance(minus, dict):
+                earliest = minus
+            out.append({"plus": plus, "minus": minus, "earliest": earliest})
+        return out
+
     def _draw_frame(self) -> None:
         tmin = float(np.min(np.asarray(self.tetra.sampled_trajectory.ts, dtype=float)))
         tmax = float(np.max(np.asarray(self.tetra.sampled_trajectory.ts, dtype=float)))
-        point_b = tuple(float(v) for v in self.observer_b.tolist())
-        scan_samples_now = 257 if (self.prev_corner_batch is None or self.prev_face_batch is None) else 41
-
-        corner_batch = pvis._solve_interpolated_linearized_batch_for_t0(
-            interp=self.interp,
+        scan_samples_now = 81
+        corner_batch = self._solve_local_batch_for_t0(
             sampled_trajectories=self.corner_traj,
-            point_b=point_b,
             t0=float(self.t),
             tmin=tmin,
             tmax=tmax,
             scan_samples=int(scan_samples_now),
-            root_max_iter=12,
-            root_tol_time=1e-6,
-            use_gpu=bool(self.chk_gpu.isChecked()),
-            batch_size=5000,
-            gpu_min_batch=256,
-            previous_batch=self.prev_corner_batch,
-            previous_t0=self.prev_corner_t0,
         )
-        face_batch = pvis._solve_interpolated_linearized_batch_for_t0(
-            interp=self.interp,
-            sampled_trajectories=self.face_traj,
-            point_b=point_b,
-            t0=float(self.t),
-            tmin=tmin,
-            tmax=tmax,
-            scan_samples=int(scan_samples_now),
-            root_max_iter=12,
-            root_tol_time=1e-6,
-            use_gpu=bool(self.chk_gpu.isChecked()),
-            batch_size=5000,
-            gpu_min_batch=256,
-            previous_batch=self.prev_face_batch,
-            previous_t0=self.prev_face_t0,
-        )
-        self.prev_corner_batch = corner_batch
-        self.prev_face_batch = face_batch
-        self.prev_corner_t0 = float(self.t)
-        self.prev_face_t0 = float(self.t)
 
         corner_arrival_plus = np.full((4, 3), np.nan, dtype=float)
         corner_arrival_minus = np.full((4, 3), np.nan, dtype=float)
@@ -563,6 +898,7 @@ class InertialViewerPyVista:
         self.lbl_vis.setText(f"corners visible (+/-): {plus_count}/{minus_count}")
         self.lbl_status.setText("running" if self.running else "paused")
         self.lbl_sky.setText(self.sky_status)
+        self.lbl_ray.setText(f"{self.ray_local_status} | {self.ray_sky_status}")
         self.plotter.render()
 
     def show(self) -> None:
@@ -572,14 +908,14 @@ class InertialViewerPyVista:
 
 
 def main() -> None:
-    precompute = _resolve_precompute_path(Path("data") / "earliest_angles_precompute_10rs.npz")
+    ray_local_interp = _resolve_ray_local_interp_path(Path("ray_tracing") / "multi_sequences_interp_table.npz")
+    ray_sky_interp = _resolve_ray_sky_interp_path(Path("ray_tracing") / "sky_interp_table.npz")
     sky_vertices = _resolve_sky_vertices_path(Path("data") / "sky_vertices_precompute_100rs_sub2.npz")
-    sky_interp = _resolve_sky_interp_path(Path("data") / "earliest_angles_sky_100rs_fixed_ar_two_family_solver.npz")
     sky_image = _resolve_sky_image(Path("sky_projections") / "checkerboard_equirect.png")
     ui = InertialViewerPyVista(
-        precompute_npz=precompute,
+        ray_local_interp_npz=ray_local_interp,
+        ray_sky_interp_npz=ray_sky_interp,
         sky_vertices_npz=sky_vertices,
-        sky_interp_npz=sky_interp,
         sky_image_path=sky_image,
     )
     ui.show()
